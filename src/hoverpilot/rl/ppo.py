@@ -62,6 +62,7 @@ class PPOConfig:
     initial_action: Tuple[float, float, float, float] = (0.0, 0.0, 0.55, 0.0)
     wait_action: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     tensorboard_log_dir: Optional[str] = "runs/hoverpilot-ppo"
+    device: str = "auto"
 
 
 class ActorCritic(nn.Module):
@@ -175,10 +176,24 @@ class RolloutBuffer:
             )
 
 
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested, but PyTorch cannot access a CUDA device.")
+    if requested == "mps":
+        mps = getattr(torch.backends, "mps", None)
+        if mps is None or not mps.is_available():
+            raise ValueError("MPS was requested, but PyTorch cannot access an MPS device.")
+    if requested not in {"cpu", "cuda", "mps"}:
+        raise ValueError(f"Unsupported device {requested!r}; choose auto, cpu, cuda, or mps.")
+    return torch.device(requested)
+
+
 class PPOTrainer:
     def __init__(self, config: PPOConfig):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = resolve_device(config.device)
         self.env = self._build_env()
         observation_dim = int(np.prod(self.env.observation_space.shape))
         action_dim = int(np.prod(self.env.action_space.shape))
@@ -641,6 +656,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     train_parser.add_argument("--eval-episodes", type=int, default=3)
     train_parser.add_argument("--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo")
     train_parser.add_argument("--disable-tensorboard", action="store_true")
+    train_parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="Training device. auto selects CUDA when available and otherwise CPU; MPS is opt-in.",
+    )
     train_parser.add_argument("--host", type=str, default=HOST)
     train_parser.add_argument("--port", type=int, default=PORT)
 
@@ -677,6 +698,7 @@ def main(argv: Optional[List[str]] = None):
             eval_episodes=args.eval_episodes,
             log_interval=args.log_interval,
             tensorboard_log_dir=None if args.disable_tensorboard else args.tensorboard_log_dir,
+            device=args.device,
         )
         trainer = PPOTrainer(config)
         trainer.train()

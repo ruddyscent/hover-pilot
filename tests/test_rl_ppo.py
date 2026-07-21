@@ -2,13 +2,15 @@ import unittest
 
 try:
     import numpy as np
-    from hoverpilot.rl.ppo import PPOConfig, PPOTrainer, reset_env_with_wait
+    from hoverpilot.rl.ppo import PPOConfig, PPOTrainer, parse_args, reset_env_with_wait, resolve_device
     IMPORT_ERROR = None
 except Exception as exc:
     np = None
     PPOConfig = None
     PPOTrainer = None
+    parse_args = None
     reset_env_with_wait = None
+    resolve_device = None
     IMPORT_ERROR = exc
 
 
@@ -45,6 +47,23 @@ class PPOTrainingModuleTests(unittest.TestCase):
         trainer = PPOTrainer(config)
         self.assertEqual(trainer.config.timesteps, 1)
         self.assertEqual(trainer.config.max_episode_steps, 1)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_auto_device_is_cuda_or_cpu_and_never_implicitly_mps(self):
+        device = resolve_device("auto")
+
+        self.assertIn(device.type, {"cuda", "cpu"})
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_train_cli_accepts_explicit_mps_device(self):
+        args = parse_args(["train", "--device", "mps"])
+
+        self.assertEqual(args.device, "mps")
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_unknown_device_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported device"):
+            resolve_device("tpu")
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_reset_wait_helper_recovers_via_polling(self):

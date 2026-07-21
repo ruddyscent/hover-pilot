@@ -170,6 +170,32 @@ The environment prefers explicit RealFlight Link reset signals first. Teleport /
 
 A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
 
+### macOS Metal / MPS
+
+The shared Dev Container is intended for reproducible CPU development and testing.
+Docker Desktop runs it inside a Linux virtual machine and does not expose the macOS
+Metal Performance Shaders (MPS) device to the container. To use PyTorch with Metal
+acceleration on an Apple Silicon Mac, install and run HoverPilot directly on the
+macOS host instead of inside the Dev Container:
+
+```bash
+uv sync --extra rl
+uv run python -c "import torch; print(torch.backends.mps.is_available())"
+```
+
+The availability check must print `True` before an application can use MPS. MPS is
+deliberately opt-in because this project's small policy network and sequential
+simulator communication may be faster on CPU. To try MPS, select it explicitly:
+
+```bash
+uv run hoverpilot-ppo train --device mps --timesteps 50000 --save-path ppo_hoverpilot.pt
+```
+
+The `--device` option accepts `auto`, `cpu`, `cuda`, or `mps`. The default `auto`
+mode selects CUDA when available and otherwise uses CPU; it never selects MPS
+implicitly. The Dev Container remains useful for CPU development and tests, while
+the Jetson GPU workflow is handled separately by `compose.jetson.yml`.
+
 ## NVIDIA Jetson with NGC PyTorch Container
 
 HoverPilot can be run on NVIDIA Jetson inside an NVIDIA NGC PyTorch container using
