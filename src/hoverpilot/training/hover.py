@@ -10,6 +10,7 @@ REWARD_PROFILE_ELEVATOR = "elevator"
 REWARD_PROFILE_AILERON = "aileron"
 REWARD_PROFILE_RUDDER = "rudder"
 REWARD_PROFILE_THROTTLE = "throttle"
+REWARD_PROFILE_ELEVATOR_THROTTLE = "elevator-throttle"
 STANDARD_HOVER_INCLINATION_DEG = 0.0
 REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
 
@@ -337,7 +338,10 @@ def compute_reward(
         survival_reward = config.survival_reward
         target_inclination_error_deg = 0.0
         inclination_tracking_error_deg = 0.0
-    elif config.profile == REWARD_PROFILE_ELEVATOR:
+    elif config.profile in {
+        REWARD_PROFILE_ELEVATOR,
+        REWARD_PROFILE_ELEVATOR_THROTTLE,
+    }:
         features = (
             elevator_features
             if elevator_features is not None
@@ -410,6 +414,10 @@ def compute_reward(
         action_smoothness_penalty = config.elevator_smoothness_weight * (
             elevator_delta / 2.0
         ) ** 2
+        if config.profile == REWARD_PROFILE_ELEVATOR_THROTTLE:
+            action_smoothness_penalty += (
+                config.throttle_smoothness_weight * throttle_delta**2
+            )
         survival_reward = config.survival_reward
     elif config.profile == REWARD_PROFILE_STANDARD:
         x_error = state.m_aircraftPositionX_MTR - config.target_x_m

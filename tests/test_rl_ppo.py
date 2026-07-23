@@ -34,6 +34,7 @@ else:
         CONTROL_MODE_AILERON,
         CONTROL_MODE_ALL,
         CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_ELEVATOR_THROTTLE,
         CONTROL_MODE_RUDDER,
         CONTROL_MODE_THROTTLE,
         POLICY_PRESET_ELEVATOR_PD,
@@ -47,6 +48,7 @@ else:
         RolloutBuffer,
         build_policy_checkpoint,
         _expand_policy_action,
+        _initial_env_action,
         load_policy_checkpoint,
         parse_args,
         reset_env_with_wait,
@@ -452,6 +454,57 @@ class PPOTrainingModuleTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(action, [0.0, 0.0, 0.7, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_elevator_throttle_policy_has_independent_restoring_channels(self):
+        model = ActorCritic(
+            6,
+            np.asarray([-1.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR_THROTTLE,
+        )
+        probe = torch.eye(6, dtype=torch.float32)
+        actions = model.deterministic_action(probe).detach()
+        self.assertIsNotNone(model.throttle_policy_trim)
+        trim = model.throttle_policy_trim.detach()
+
+        self.assertEqual(tuple(actions.shape), (6, 2))
+        self.assertLess(float(actions[0, 0]), 0.0)
+        self.assertGreater(float(actions[1, 0]), 0.0)
+        self.assertAlmostEqual(float(actions[4, 0]), 0.0)
+        self.assertAlmostEqual(float(actions[5, 0]), 0.0)
+        self.assertLess(float(actions[4, 1]), float(trim))
+        self.assertLess(float(actions[5, 1]), float(trim))
+        self.assertAlmostEqual(float(actions[0, 1]), float(trim))
+        self.assertAlmostEqual(float(actions[1, 1]), float(trim))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_elevator_throttle_action_expands_to_only_enabled_channels(self):
+        policy_space = gym.spaces.Box(
+            low=np.asarray([-1.0, 0.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        action = _expand_policy_action(
+            np.asarray([-0.25, 0.7], dtype=np.float32),
+            policy_space,
+            CONTROL_MODE_ELEVATOR_THROTTLE,
+            0.2,
+        )
+
+        np.testing.assert_allclose(action, [0.0, -0.25, 0.7, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_elevator_throttle_initial_action_uses_hover_throttle(self):
+        action = _initial_env_action(
+            CONTROL_MODE_ELEVATOR_THROTTLE,
+            0.2,
+            (0.0, 0.0, 0.55, 0.0),
+        )
+
+        np.testing.assert_allclose(action, [0.0, 0.0, 0.65, 0.0])
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_throttle_checkpoint_round_trip_preserves_observation_scales(self):

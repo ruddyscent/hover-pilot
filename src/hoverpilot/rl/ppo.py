@@ -29,11 +29,13 @@ from hoverpilot.config import HOST, PORT
 from hoverpilot.envs import (
     AILERON_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
+    ELEVATOR_THROTTLE_HOVER_TASK,
     RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     HoverPilotHoverEnv,
     elevator_features_to_observation,
+    elevator_throttle_features_to_observation,
 )
 from hoverpilot.rl.elevator_diagnostics import diagnose_elevator_response
 from hoverpilot.rflink.client import RFLinkClient
@@ -49,17 +51,20 @@ CONTROL_MODE_ELEVATOR = "elevator"
 CONTROL_MODE_AILERON = "aileron"
 CONTROL_MODE_RUDDER = "rudder"
 CONTROL_MODE_THROTTLE = "throttle"
+CONTROL_MODE_ELEVATOR_THROTTLE = "elevator-throttle"
 CONTROL_MODES = (
     CONTROL_MODE_ALL,
     CONTROL_MODE_AILERON,
     CONTROL_MODE_ELEVATOR,
     CONTROL_MODE_RUDDER,
     CONTROL_MODE_THROTTLE,
+    CONTROL_MODE_ELEVATOR_THROTTLE,
 )
 CONNECTION_EPISODE_CONTROL_MODES = {
     CONTROL_MODE_AILERON,
     CONTROL_MODE_RUDDER,
     CONTROL_MODE_THROTTLE,
+    CONTROL_MODE_ELEVATOR_THROTTLE,
 }
 POLICY_PRESET_NONE = "none"
 POLICY_PRESET_ELEVATOR_PD = "elevator-pd"
@@ -208,6 +213,9 @@ def _build_hover_env(
                 CONTROL_MODE_ELEVATOR: ELEVATOR_HOVER_TASK,
                 CONTROL_MODE_RUDDER: RUDDER_HOVER_TASK,
                 CONTROL_MODE_THROTTLE: THROTTLE_HOVER_TASK,
+                CONTROL_MODE_ELEVATOR_THROTTLE: (
+                    ELEVATOR_THROTTLE_HOVER_TASK
+                ),
             }[control_mode]
         ),
         start_body_rate_threshold_deg_s=(
@@ -220,6 +228,7 @@ def _build_hover_env(
             if control_mode in {
                 CONTROL_MODE_RUDDER,
                 CONTROL_MODE_THROTTLE,
+                CONTROL_MODE_ELEVATOR_THROTTLE,
             }
             else 0.5
         ),
@@ -245,12 +254,16 @@ def _validate_rflink_settings(
 
 
 def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
-    elevator_mode = config.control_mode == CONTROL_MODE_ELEVATOR
-    single_axis_mode = config.control_mode in {
+    elevator_mode = config.control_mode in {
+        CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_ELEVATOR_THROTTLE,
+    }
+    structured_control_mode = config.control_mode in {
         CONTROL_MODE_AILERON,
         CONTROL_MODE_ELEVATOR,
         CONTROL_MODE_RUDDER,
         CONTROL_MODE_THROTTLE,
+        CONTROL_MODE_ELEVATOR_THROTTLE,
     }
     return replace(
         config,
@@ -268,7 +281,7 @@ def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
             if config.learning_rate is not None
             else (
                 DEFAULT_ELEVATOR_LEARNING_RATE
-                if single_axis_mode
+                if structured_control_mode
                 else DEFAULT_LEARNING_RATE
             )
         ),
@@ -277,7 +290,7 @@ def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
             if config.eval_episodes is not None
             else (
                 DEFAULT_ELEVATOR_EVAL_EPISODES
-                if single_axis_mode
+                if structured_control_mode
                 else DEFAULT_EVAL_EPISODES
             )
         ),
@@ -335,9 +348,16 @@ class ActorCritic(nn.Module):
             )
         self.policy_preset = policy_preset
         self.enforce_elevator_symmetry = (
-            control_mode == CONTROL_MODE_ELEVATOR
+            control_mode in {
+                CONTROL_MODE_ELEVATOR,
+                CONTROL_MODE_ELEVATOR_THROTTLE,
+            }
             and observation_dim == 6
-            and action_dim == 1
+            and action_dim == (
+                2
+                if control_mode == CONTROL_MODE_ELEVATOR_THROTTLE
+                else 1
+            )
         )
         self.enforce_aileron_symmetry = (
             control_mode == CONTROL_MODE_AILERON
@@ -350,9 +370,16 @@ class ActorCritic(nn.Module):
             and action_dim == 1
         )
         self.enforce_throttle_structure = (
-            control_mode == CONTROL_MODE_THROTTLE
-            and observation_dim == 2
-            and action_dim == 1
+            (
+                control_mode == CONTROL_MODE_THROTTLE
+                and observation_dim == 2
+                and action_dim == 1
+            )
+            or (
+                control_mode == CONTROL_MODE_ELEVATOR_THROTTLE
+                and observation_dim == 6
+                and action_dim == 2
+            )
         )
         mirror_sign = (
             [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0]
@@ -545,6 +572,19 @@ class ActorCritic(nn.Module):
         hidden: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         elevator_gain = self.elevator_policy_gain
+        throttle_gain = self.throttle_policy_gain
+        if elevator_gain is not None and throttle_gain is not None:
+            assert self.throttle_policy_trim_latent is not None
+            elevator_mean = (
+                -elevator_gain[0] * obs[..., 0:1]
+                + elevator_gain[1] * obs[..., 1:2]
+            )
+            throttle_mean = (
+                self.throttle_policy_trim_latent
+                - throttle_gain[0] * obs[..., 4:5]
+                - throttle_gain[1] * obs[..., 5:6]
+            )
+            return torch.cat((elevator_mean, throttle_mean), dim=-1)
         if elevator_gain is not None:
             return (
                 -elevator_gain[0] * obs[..., 0:1]
@@ -564,7 +604,6 @@ class ActorCritic(nn.Module):
                 rudder_gain[0] * obs[..., 0:1]
                 + rudder_gain[1] * obs[..., 1:2]
             )
-        throttle_gain = self.throttle_policy_gain
         if throttle_gain is not None:
             assert self.throttle_policy_trim_latent is not None
             return (
@@ -740,6 +779,12 @@ def _policy_action_space(
     control_mode: str,
     env_action_space: gym.spaces.Box,
 ) -> gym.spaces.Box:
+    if control_mode == CONTROL_MODE_ELEVATOR_THROTTLE:
+        return gym.spaces.Box(
+            low=np.asarray([-1.0, 0.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
     if control_mode == CONTROL_MODE_THROTTLE:
         return gym.spaces.Box(
             low=np.asarray([0.0], dtype=np.float32),
@@ -776,6 +821,11 @@ def _expand_policy_action(
         policy_action_space.low,
         policy_action_space.high,
     )
+    if control_mode == CONTROL_MODE_ELEVATOR_THROTTLE:
+        return np.asarray(
+            [0.0, action[0], action[1], 0.0],
+            dtype=np.float32,
+        )
     if control_mode == CONTROL_MODE_AILERON:
         return np.asarray(
             [action[0], 0.0, elevator_fixed_throttle, 0.0],
@@ -804,7 +854,10 @@ def _initial_env_action(
     elevator_fixed_throttle: float,
     default_action: Tuple[float, float, float, float],
 ) -> np.ndarray:
-    if control_mode == CONTROL_MODE_THROTTLE:
+    if control_mode in {
+        CONTROL_MODE_THROTTLE,
+        CONTROL_MODE_ELEVATOR_THROTTLE,
+    }:
         return np.asarray(
             [0.0, 0.0, _THROTTLE_PPO_INITIAL_TRIM, 0.0],
             dtype=np.float32,
@@ -1082,6 +1135,7 @@ class PPOTrainer:
                     CONTROL_MODE_ELEVATOR,
                     CONTROL_MODE_RUDDER,
                     CONTROL_MODE_THROTTLE,
+                    CONTROL_MODE_ELEVATOR_THROTTLE,
                 }
                 else 0.01
             )
@@ -1096,6 +1150,7 @@ class PPOTrainer:
                     CONTROL_MODE_ELEVATOR,
                     CONTROL_MODE_RUDDER,
                     CONTROL_MODE_THROTTLE,
+                    CONTROL_MODE_ELEVATOR_THROTTLE,
                 }
                 else 0.25
             )
@@ -1147,7 +1202,10 @@ class PPOTrainer:
         return SummaryWriter(log_dir=self.config.tensorboard_log_dir)
 
     def _wait_action(self) -> np.ndarray:
-        if self.config.control_mode == CONTROL_MODE_THROTTLE:
+        if self.config.control_mode in {
+            CONTROL_MODE_THROTTLE,
+            CONTROL_MODE_ELEVATOR_THROTTLE,
+        }:
             return self._initial_action()
         return np.asarray(self.config.wait_action, dtype=np.float32)
 
@@ -1165,6 +1223,8 @@ class PPOTrainer:
             return ("rudder",)
         if self.config.control_mode == CONTROL_MODE_THROTTLE:
             return ("throttle",)
+        if self.config.control_mode == CONTROL_MODE_ELEVATOR_THROTTLE:
+            return ("elevator", "throttle")
         if self.config.control_mode == CONTROL_MODE_ELEVATOR:
             return ("elevator",)
         return ("aileron", "elevator", "throttle", "rudder")
@@ -1222,7 +1282,10 @@ class PPOTrainer:
 
     def _write_elevator_recovery_probe(self, step: int):
         if (
-            self.config.control_mode != CONTROL_MODE_ELEVATOR
+            self.config.control_mode not in {
+                CONTROL_MODE_ELEVATOR,
+                CONTROL_MODE_ELEVATOR_THROTTLE,
+            }
             or self.env.observation_space.shape != (6,)
             or not hasattr(self.env, "reward_config")
         ):
@@ -1466,24 +1529,36 @@ class PPOTrainer:
         )
 
     def _write_throttle_recovery_probe(self, step: int):
-        if (
-            self.config.control_mode != CONTROL_MODE_THROTTLE
-            or self.env.observation_space.shape != (2,)
+        if self.config.control_mode not in {
+            CONTROL_MODE_THROTTLE,
+            CONTROL_MODE_ELEVATOR_THROTTLE,
+        }:
+            return
+        combined_mode = (
+            self.config.control_mode == CONTROL_MODE_ELEVATOR_THROTTLE
+        )
+        if self.env.observation_space.shape != (
+            (6,) if combined_mode else (2,)
         ):
             return
+        altitude_index = 4 if combined_mode else 0
+        vertical_velocity_index = 5 if combined_mode else 1
+        throttle_action_index = 1 if combined_mode else 0
+        probe_array = np.zeros((4, self.env.observation_space.shape[0]))
+        probe_array[0, altitude_index] = 1.0
+        probe_array[1, altitude_index] = -1.0
+        probe_array[2, vertical_velocity_index] = 1.0
+        probe_array[3, vertical_velocity_index] = -1.0
         probe = torch.tensor(
-            [
-                [1.0, 0.0],
-                [-1.0, 0.0],
-                [0.0, 1.0],
-                [0.0, -1.0],
-            ],
+            probe_array,
             dtype=torch.float32,
             device=self.device,
         )
         with torch.no_grad():
             latent_means = (
-                self.model._compute_policy_mean(probe)[:, 0]
+                self.model._compute_policy_mean(probe)[
+                    :, throttle_action_index
+                ]
                 .detach()
                 .cpu()
                 .numpy()
@@ -1543,6 +1618,11 @@ class PPOTrainer:
         features: ElevatorHoverFeatures,
     ) -> np.ndarray:
         config = self.env.reward_config
+        if self.config.control_mode == CONTROL_MODE_ELEVATOR_THROTTLE:
+            return elevator_throttle_features_to_observation(
+                features,
+                config=config,
+            )
         return elevator_features_to_observation(
             features,
             config=config,
@@ -1824,6 +1904,14 @@ class PPOTrainer:
         longitudinal_velocity = float(
             features.get("longitudinal_velocity_mps", 0.0)
         )
+        combined_mode = (
+            self.config.control_mode
+            == CONTROL_MODE_ELEVATOR_THROTTLE
+        )
+        altitude_error = float(features.get("altitude_error_m", 0.0))
+        upward_velocity = -float(
+            features.get("vertical_velocity_mps", 0.0)
+        )
         target_inclination_error = float(
             info.get("elevator_recovery_target_deg", 0.0)
         )
@@ -1836,6 +1924,13 @@ class PPOTrainer:
                 0.0,
             )
         )
+        combined_description = (
+            f"alt_error={altitude_error:+.2f}m "
+            f"up_velocity={upward_velocity:+.2f}m/s "
+            f"throttle={float(env_action[2]):.3f} "
+            if combined_mode
+            else ""
+        )
         print(
             f"[PPO] control step={total_steps} reward={reward:+.3f} "
             f"elevator={float(env_action[1]):+.3f} "
@@ -1844,6 +1939,7 @@ class PPOTrainer:
             f"pitch_rate={pitch_rate:+.2f}deg/s "
             f"long_error={longitudinal_error:+.2f}m "
             f"long_velocity={longitudinal_velocity:+.2f}m/s "
+            f"{combined_description}"
             f"radial={radial_distance:.2f}m"
         )
         self._write_scalar(
@@ -1893,6 +1989,22 @@ class PPOTrainer:
             radial_distance,
             total_steps,
         )
+        if combined_mode:
+            self._write_scalar(
+                "train/control/throttle_action",
+                float(env_action[2]),
+                total_steps,
+            )
+            self._write_scalar(
+                "train/state/altitude_error_m",
+                altitude_error,
+                total_steps,
+            )
+            self._write_scalar(
+                "train/state/vertical_velocity_mps",
+                upward_velocity,
+                total_steps,
+            )
 
     def _log_rollout_summary(
         self,
@@ -2086,6 +2198,7 @@ class PPOTrainer:
                             CONTROL_MODE_ELEVATOR,
                             CONTROL_MODE_RUDDER,
                             CONTROL_MODE_THROTTLE,
+                            CONTROL_MODE_ELEVATOR_THROTTLE,
                         }
                         and
                         self.config.telemetry_log_interval_steps > 0
@@ -2388,7 +2501,10 @@ class PPOTrainer:
                         )
                     elif self.config.control_mode == CONTROL_MODE_THROTTLE:
                         pass
-                    elif self.config.control_mode == CONTROL_MODE_ELEVATOR:
+                    elif self.config.control_mode in {
+                        CONTROL_MODE_ELEVATOR,
+                        CONTROL_MODE_ELEVATOR_THROTTLE,
+                    }:
                         elevator_features = info.get(
                             "elevator_hover_features",
                             {},
@@ -2533,7 +2649,10 @@ class PPOPlayer:
         )
 
     def _wait_action(self) -> np.ndarray:
-        if self.control_mode == CONTROL_MODE_THROTTLE:
+        if self.control_mode in {
+            CONTROL_MODE_THROTTLE,
+            CONTROL_MODE_ELEVATOR_THROTTLE,
+        }:
             return self._initial_action()
         return np.asarray(self.config.wait_action, dtype=np.float32)
 
@@ -2544,7 +2663,10 @@ class PPOPlayer:
         episode_limit = "unlimited" if self.config.episodes == 0 else str(self.config.episodes)
         throttle_description = (
             "throttle=policy"
-            if self.control_mode == CONTROL_MODE_THROTTLE
+            if self.control_mode in {
+                CONTROL_MODE_THROTTLE,
+                CONTROL_MODE_ELEVATOR_THROTTLE,
+            }
             else f"fixed_throttle={self.elevator_fixed_throttle:.3f}"
         )
         print(
@@ -2794,8 +2916,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=CONTROL_MODES,
         default=CONTROL_MODE_ALL,
         help=(
-            "Policy-controlled channels. aileron, elevator, rudder, and throttle use "
-            "one-dimensional single-axis policies."
+            "Policy-controlled channels. aileron, elevator, rudder, and "
+            "throttle use one-dimensional policies; elevator-throttle "
+            "uses a two-dimensional policy."
         ),
     )
     train_parser.add_argument(

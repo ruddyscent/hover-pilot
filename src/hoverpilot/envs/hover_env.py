@@ -18,6 +18,7 @@ from hoverpilot.training.hover import (
     ThrottleHoverFeatures,
     REWARD_PROFILE_AILERON,
     REWARD_PROFILE_ELEVATOR,
+    REWARD_PROFILE_ELEVATOR_THROTTLE,
     REWARD_PROFILE_RUDDER,
     REWARD_PROFILE_STANDARD,
     REWARD_PROFILE_THROTTLE,
@@ -52,9 +53,12 @@ class HoverTaskProfile(str, Enum):
     AILERON = "aileron"
     RUDDER = "rudder"
     THROTTLE = "throttle"
+    ELEVATOR_THROTTLE = "elevator-throttle"
 
     @property
     def reward_profile(self) -> str:
+        if self is HoverTaskProfile.ELEVATOR_THROTTLE:
+            return REWARD_PROFILE_ELEVATOR_THROTTLE
         if self is HoverTaskProfile.THROTTLE:
             return REWARD_PROFILE_THROTTLE
         if self is HoverTaskProfile.RUDDER:
@@ -67,6 +71,8 @@ class HoverTaskProfile(str, Enum):
 
     @property
     def observation_dim(self) -> int:
+        if self is HoverTaskProfile.ELEVATOR_THROTTLE:
+            return 6
         if self is HoverTaskProfile.THROTTLE:
             return 2
         if self is HoverTaskProfile.RUDDER:
@@ -79,7 +85,10 @@ class HoverTaskProfile(str, Enum):
 
     @property
     def anchor_heading_to_reset_state(self) -> bool:
-        return self is HoverTaskProfile.ELEVATOR
+        return self in {
+            HoverTaskProfile.ELEVATOR,
+            HoverTaskProfile.ELEVATOR_THROTTLE,
+        }
 
     @property
     def require_vertical_start(self) -> bool:
@@ -88,6 +97,7 @@ class HoverTaskProfile(str, Enum):
             HoverTaskProfile.ELEVATOR,
             HoverTaskProfile.RUDDER,
             HoverTaskProfile.THROTTLE,
+            HoverTaskProfile.ELEVATOR_THROTTLE,
         }
 
     @property
@@ -100,6 +110,14 @@ class HoverTaskProfile(str, Enum):
             HoverTaskProfile.AILERON,
             HoverTaskProfile.RUDDER,
             HoverTaskProfile.THROTTLE,
+            HoverTaskProfile.ELEVATOR_THROTTLE,
+        }
+
+    @property
+    def uses_elevator_features(self) -> bool:
+        return self in {
+            HoverTaskProfile.ELEVATOR,
+            HoverTaskProfile.ELEVATOR_THROTTLE,
         }
 
     @property
@@ -118,6 +136,7 @@ ELEVATOR_HOVER_TASK = HoverTaskProfile.ELEVATOR
 AILERON_HOVER_TASK = HoverTaskProfile.AILERON
 RUDDER_HOVER_TASK = HoverTaskProfile.RUDDER
 THROTTLE_HOVER_TASK = HoverTaskProfile.THROTTLE
+ELEVATOR_THROTTLE_HOVER_TASK = HoverTaskProfile.ELEVATOR_THROTTLE
 
 
 @dataclass
@@ -211,6 +230,21 @@ def elevator_features_to_observation(
         dtype=np.float32,
     )
     return np.clip(observation, -5.0, 5.0).astype(np.float32, copy=False)
+
+
+def elevator_throttle_features_to_observation(
+    elevator_features: ElevatorHoverFeatures,
+    *,
+    config: RewardConfig,
+) -> np.ndarray:
+    observation = elevator_features_to_observation(
+        elevator_features,
+        config=config,
+    ).copy()
+    # The shared elevator feature uses RealFlight's down-positive world W.
+    # Throttle control uses an up-positive vertical velocity.
+    observation[-1] *= -1.0
+    return observation
 
 
 def aileron_features_to_observation(
@@ -366,6 +400,7 @@ class HoverPilotHoverEnv(gym.Env):
         self._pending_episode_start = None  # type: Optional[Tuple[FlightAxisState, str]]
         self._waiting_for_reset = False
         self._episode_started = False
+        self._target_initialized = False
         self._ground_contact_started_at_s = None  # type: Optional[float]
         self._previous_elevator = 0.0
         self._previous_aileron = 0.0
@@ -484,6 +519,16 @@ class HoverPilotHoverEnv(gym.Env):
                 features,
                 config=self.reward_config,
             )
+        if self.task_profile == ELEVATOR_THROTTLE_HOVER_TASK:
+            features = (
+                elevator_features
+                if elevator_features is not None
+                else self._compute_elevator_features(state)
+            )
+            return elevator_throttle_features_to_observation(
+                features,
+                config=self.reward_config,
+            )
         if self.task_profile == RUDDER_HOVER_TASK:
             features = (
                 rudder_features
@@ -565,7 +610,7 @@ class HoverPilotHoverEnv(gym.Env):
         state = self._client.step(rf_action)
         elevator_features = (
             self._compute_elevator_features(state)
-            if self.task_profile == ELEVATOR_HOVER_TASK
+            if self.task_profile.uses_elevator_features
             else None
         )
         aileron_features = (
@@ -750,7 +795,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         elevator_features = (
             self._compute_elevator_features(state)
-            if self.task_profile == ELEVATOR_HOVER_TASK
+            if self.task_profile.uses_elevator_features
             else None
         )
         aileron_features = (
@@ -824,7 +869,7 @@ class HoverPilotHoverEnv(gym.Env):
         state = self._last_state
         elevator_features = (
             self._compute_elevator_features(state)
-            if self.task_profile == ELEVATOR_HOVER_TASK
+            if self.task_profile.uses_elevator_features
             else None
         )
         aileron_features = (
@@ -951,7 +996,10 @@ class HoverPilotHoverEnv(gym.Env):
         return self._client.request_state(action)
 
     def _safe_start_action(self) -> RFControlAction:
-        if self.task_profile == THROTTLE_HOVER_TASK:
+        if self.task_profile in {
+            THROTTLE_HOVER_TASK,
+            ELEVATOR_THROTTLE_HOVER_TASK,
+        }:
             return RFControlAction(
                 throttle=THROTTLE_HOVER_START_THROTTLE
             )
@@ -963,7 +1011,15 @@ class HoverPilotHoverEnv(gym.Env):
         self._waiting_for_reset = False
         self._episode_started = True
         self._ground_contact_started_at_s = None
-        if self.anchor_target_to_reset_state:
+        should_anchor_episode_frame = (
+            self.task_profile != ELEVATOR_THROTTLE_HOVER_TASK
+            or not self._target_initialized
+            or episode_start_reason in TRAINER_RESET_REASONS
+        )
+        if (
+            self.anchor_target_to_reset_state
+            and should_anchor_episode_frame
+        ):
             self.reward_config = replace(
                 self.reward_config,
                 target_x_m=state.m_aircraftPositionX_MTR,
@@ -974,7 +1030,11 @@ class HoverPilotHoverEnv(gym.Env):
                     else self.reward_config.target_altitude_agl_m
                 ),
             )
-        if self.task_profile.anchor_heading_to_reset_state:
+            self._target_initialized = True
+        if (
+            self.task_profile.anchor_heading_to_reset_state
+            and should_anchor_episode_frame
+        ):
             self.reward_config = replace(
                 self.reward_config,
                 target_azimuth_deg=state.m_azimuth_DEG,
@@ -992,7 +1052,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         elevator_features = (
             self._compute_elevator_features(state)
-            if self.task_profile == ELEVATOR_HOVER_TASK
+            if self.task_profile.uses_elevator_features
             else None
         )
         aileron_features = (
@@ -1114,7 +1174,7 @@ class HoverPilotHoverEnv(gym.Env):
         if reward_breakdown is not None:
             info["reward_breakdown"] = asdict(reward_breakdown)
             info["termination_reason"] = reward_breakdown.termination_reason
-        if self.task_profile == ELEVATOR_HOVER_TASK:
+        if self.task_profile.uses_elevator_features:
             features = (
                 elevator_features
                 if elevator_features is not None

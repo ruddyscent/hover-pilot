@@ -7,9 +7,11 @@ from hoverpilot.training.hover import (
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_RUDDER,
     REWARD_PROFILE_THROTTLE,
+    REWARD_PROFILE_ELEVATOR_THROTTLE,
     RudderHoverFeatures,
     ThrottleHoverFeatures,
     RewardConfig,
+    ElevatorHoverFeatures,
     angular_error_deg,
     compute_aileron_hover_features,
     compute_elevator_hover_features,
@@ -362,6 +364,35 @@ class HoverTrainingTests(unittest.TestCase):
 
         self.assertEqual(features.altitude_error_m, 0.5)
         self.assertEqual(features.vertical_velocity_mps, 3.0)
+
+    def test_elevator_throttle_reward_penalizes_both_state_and_control_changes(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_ELEVATOR_THROTTLE,
+        )
+        balanced = compute_reward(
+            self._state(),
+            config,
+            elevator_features=ElevatorHoverFeatures(
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ),
+        )
+        disturbed = compute_reward(
+            self._state(),
+            config,
+            elevator_delta=0.4,
+            throttle_delta=0.2,
+            elevator_features=ElevatorHoverFeatures(
+                10.0, 20.0, 2.0, 1.0, 0.75, -2.5
+            ),
+        )
+
+        self.assertGreater(disturbed.position_penalty, 0.0)
+        self.assertGreater(disturbed.altitude_penalty, 0.0)
+        self.assertGreater(disturbed.attitude_penalty, 0.0)
+        self.assertGreater(disturbed.angular_rate_penalty, 0.0)
+        self.assertGreater(disturbed.velocity_penalty, 0.0)
+        self.assertGreater(disturbed.action_smoothness_penalty, 0.0)
+        self.assertLess(disturbed.reward, balanced.reward)
 
     def test_elevator_recovery_target_is_symmetric_and_bounded(self):
         self.assertEqual(

@@ -392,6 +392,29 @@ Throttle-only hover also uses deliberate RFLink close/reconnect boundaries at
 each 300-step time limit. Reconnecting does not re-anchor the altitude target,
 so accumulated height drift cannot be hidden by starting a new episode.
 
+For an Airplane Hover Trainer configuration where only elevator and throttle
+are enabled, use the two-dimensional combined mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode elevator-throttle \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_elevator_throttle.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-elevator-throttle \
+  --seed 42
+```
+
+This mode combines the six elevator observations with an up-positive vertical
+velocity for throttle. Its actor has independent constrained restoring
+channels: elevator uses inclination-tracking error and pitch rate, while
+throttle uses AGL error, vertical velocity, and a learned hover trim. Aileron
+and rudder remain neutral. The reward retains elevator position, attitude,
+rate, altitude, and velocity terms and adds throttle smoothness.
+
+Every 300-step time limit closes and reconnects RFLink. The initial local
+position, heading, and AGL target survive these deliberate reconnects so that
+drift is not hidden, but an actual trainer reposition establishes a new local
+target.
+
 For a RealFlight Hover Trainer configuration where PPO controls only elevator,
 use a one-dimensional policy and keep the other transmitted channels fixed:
 

@@ -5,12 +5,14 @@ import numpy as np
 from hoverpilot.envs import (
     AILERON_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
+    ELEVATOR_THROTTLE_HOVER_TASK,
     HoverPilotHoverEnv,
     RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     aileron_features_to_observation,
     elevator_features_to_observation,
+    elevator_throttle_features_to_observation,
     gym_action_to_rf_action,
     rudder_features_to_observation,
     state_to_observation,
@@ -20,6 +22,7 @@ from hoverpilot.envs.hover_env import EpisodeLifecycleResult
 from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.training.hover import (
     AileronHoverFeatures,
+    ElevatorHoverFeatures,
     RewardConfig,
     RudderHoverFeatures,
     ThrottleHoverFeatures,
@@ -325,6 +328,71 @@ class HoverEnvTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(observation, [0.5, -0.5])
+
+    def test_elevator_throttle_observation_uses_upward_positive_velocity(self):
+        observation = elevator_throttle_features_to_observation(
+            ElevatorHoverFeatures(
+                inclination_error_deg=0.0,
+                pitch_rate_deg_s=0.0,
+                longitudinal_position_error_m=0.0,
+                longitudinal_velocity_mps=0.0,
+                altitude_error_m=0.75,
+                vertical_velocity_mps=-2.5,
+            ),
+            config=RewardConfig(),
+        )
+
+        np.testing.assert_allclose(
+            observation,
+            [0.0, 0.0, 0.0, 0.0, 0.5, 0.5],
+        )
+
+    def test_elevator_throttle_target_survives_connection_episode_boundary(self):
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=ELEVATOR_THROTTLE_HOVER_TASK,
+            client_factory=lambda: StubRFLinkClient([]),
+        )
+        first = self._state(
+            m_aircraftPositionX_MTR=12.0,
+            m_aircraftPositionY_MTR=-3.0,
+            m_altitudeAGL_MTR=2.0,
+            m_inclination_DEG=90.0,
+            m_azimuth_DEG=37.0,
+        )
+        drifted = self._state(
+            m_aircraftPositionX_MTR=14.0,
+            m_aircraftPositionY_MTR=-4.0,
+            m_altitudeAGL_MTR=3.0,
+            m_inclination_DEG=90.0,
+            m_azimuth_DEG=45.0,
+        )
+        repositioned = self._state(
+            m_aircraftPositionX_MTR=1.0,
+            m_aircraftPositionY_MTR=2.0,
+            m_altitudeAGL_MTR=1.8,
+            m_inclination_DEG=90.0,
+            m_azimuth_DEG=10.0,
+        )
+
+        env._start_episode_from_state(first, "reset_ready")
+        env._start_episode_from_state(drifted, "reset_ready")
+
+        self.assertEqual(env.reward_config.target_x_m, 12.0)
+        self.assertEqual(env.reward_config.target_y_m, -3.0)
+        self.assertEqual(env.reward_config.target_altitude_agl_m, 2.0)
+        self.assertEqual(env.reward_config.target_azimuth_deg, 37.0)
+
+        env._start_episode_from_state(
+            repositioned,
+            "trainer_repositioned",
+        )
+
+        self.assertEqual(env.reward_config.target_x_m, 1.0)
+        self.assertEqual(env.reward_config.target_y_m, 2.0)
+        self.assertEqual(env.reward_config.target_altitude_agl_m, 1.8)
+        self.assertEqual(env.reward_config.target_azimuth_deg, 10.0)
 
     def test_elevator_profile_anchors_heading_and_zeroes_nose_up_error(self):
         client = StubRFLinkClient([
