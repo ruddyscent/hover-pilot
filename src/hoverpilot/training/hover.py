@@ -9,6 +9,7 @@ REWARD_PROFILE_STANDARD = "standard"
 REWARD_PROFILE_ELEVATOR = "elevator"
 REWARD_PROFILE_AILERON = "aileron"
 REWARD_PROFILE_RUDDER = "rudder"
+REWARD_PROFILE_THROTTLE = "throttle"
 STANDARD_HOVER_INCLINATION_DEG = 0.0
 REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
 
@@ -42,6 +43,9 @@ class RewardConfig:
     rudder_angle_error_weight: float = 1.0
     rudder_yaw_rate_weight: float = 0.5
     rudder_smoothness_weight: float = 0.01
+    throttle_altitude_error_weight: float = 1.0
+    throttle_vertical_velocity_weight: float = 0.5
+    throttle_smoothness_weight: float = 0.01
     roll_error_scale_deg: float = 30.0
     roll_rate_scale_deg_s: float = 60.0
     yaw_rate_scale_deg_s: float = 30.0
@@ -133,6 +137,14 @@ class RudderHoverFeatures:
     yaw_rate_deg_s: float
 
 
+@dataclass(frozen=True)
+class ThrottleHoverFeatures:
+    """State features that throttle-only hover can directly influence."""
+
+    altitude_error_m: float
+    vertical_velocity_mps: float
+
+
 @dataclass
 class TerminationResult:
     terminated: bool
@@ -220,6 +232,8 @@ def compute_reward(
     aileron_features: Optional[AileronHoverFeatures] = None,
     rudder_delta: float = 0.0,
     rudder_features: Optional[RudderHoverFeatures] = None,
+    throttle_delta: float = 0.0,
+    throttle_features: Optional[ThrottleHoverFeatures] = None,
 ) -> RewardBreakdown:
     termination = compute_termination(
         state,
@@ -228,7 +242,39 @@ def compute_reward(
         ground_contact_duration_s=ground_contact_duration_s,
     )
 
-    if config.profile == REWARD_PROFILE_RUDDER:
+    if config.profile == REWARD_PROFILE_THROTTLE:
+        features = (
+            throttle_features
+            if throttle_features is not None
+            else compute_throttle_hover_features(
+                state,
+                target_altitude_agl_m=config.target_altitude_agl_m,
+            )
+        )
+        position_penalty = 0.0
+        altitude_penalty = config.throttle_altitude_error_weight * (
+            _bounded_normalized_square(
+                features.altitude_error_m,
+                config.altitude_error_scale_m,
+                config.max_normalized_error_squared,
+            )
+        )
+        attitude_penalty = 0.0
+        angular_rate_penalty = 0.0
+        velocity_penalty = config.throttle_vertical_velocity_weight * (
+            _bounded_normalized_square(
+                features.vertical_velocity_mps,
+                config.velocity_error_scale_mps,
+                config.max_normalized_error_squared,
+            )
+        )
+        action_smoothness_penalty = (
+            config.throttle_smoothness_weight * throttle_delta**2
+        )
+        survival_reward = config.survival_reward
+        target_inclination_error_deg = 0.0
+        inclination_tracking_error_deg = 0.0
+    elif config.profile == REWARD_PROFILE_RUDDER:
         features = (
             rudder_features
             if rudder_features is not None
@@ -393,7 +439,11 @@ def compute_reward(
     else:
         raise ValueError(f"unsupported reward profile: {config.profile!r}")
 
-    boundary_proximity_penalty = _compute_boundary_proximity_penalty(state, config)
+    boundary_proximity_penalty = (
+        0.0
+        if config.profile == REWARD_PROFILE_THROTTLE
+        else _compute_boundary_proximity_penalty(state, config)
+    )
     terminal_penalty = config.terminal_failure_reward if termination.terminated else 0.0
 
     reward = survival_reward - (
@@ -528,6 +578,20 @@ def compute_rudder_hover_features(
     return RudderHoverFeatures(
         rudder_angle_error_deg=rudder_angle_error_deg,
         yaw_rate_deg_s=state.m_yawRate_DEGpSEC,
+    )
+
+
+def compute_throttle_hover_features(
+    state: FlightAxisState,
+    *,
+    target_altitude_agl_m: float,
+) -> ThrottleHoverFeatures:
+    return ThrottleHoverFeatures(
+        altitude_error_m=(
+            state.m_altitudeAGL_MTR - target_altitude_agl_m
+        ),
+        # RealFlight world W is positive down in this trainer.
+        vertical_velocity_mps=-state.m_velocityWorldW_MPS,
     )
 
 

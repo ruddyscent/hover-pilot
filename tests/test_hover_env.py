@@ -8,11 +8,13 @@ from hoverpilot.envs import (
     HoverPilotHoverEnv,
     RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
+    THROTTLE_HOVER_TASK,
     aileron_features_to_observation,
     elevator_features_to_observation,
     gym_action_to_rf_action,
     rudder_features_to_observation,
     state_to_observation,
+    throttle_features_to_observation,
 )
 from hoverpilot.envs.hover_env import EpisodeLifecycleResult
 from hoverpilot.rflink.models import FlightAxisState, RFControlAction
@@ -20,6 +22,7 @@ from hoverpilot.training.hover import (
     AileronHoverFeatures,
     RewardConfig,
     RudderHoverFeatures,
+    ThrottleHoverFeatures,
     compute_elevator_hover_features,
 )
 
@@ -249,6 +252,74 @@ class HoverEnvTests(unittest.TestCase):
             RudderHoverFeatures(
                 rudder_angle_error_deg=7.5,
                 yaw_rate_deg_s=-15.0,
+            ),
+            config=RewardConfig(),
+        )
+
+        np.testing.assert_allclose(observation, [0.5, -0.5])
+
+    def test_throttle_profile_keeps_fixed_agl_target_across_reconnect(self):
+        initial = self._state(
+            m_aircraftPositionX_MTR=12.0,
+            m_aircraftPositionY_MTR=-3.0,
+            m_altitudeAGL_MTR=1.3,
+            m_inclination_DEG=90.0,
+            m_flightAxisControllerIsActive=0.0,
+            m_anEngineIsRunning=0.0,
+        )
+        moved = self._state(
+            m_currentPhysicsTime_SEC=10.1,
+            m_aircraftPositionX_MTR=12.0,
+            m_aircraftPositionY_MTR=-3.0,
+            m_altitudeAGL_MTR=1.4,
+            m_inclination_DEG=90.0,
+            m_velocityWorldW_MPS=-0.5,
+            m_flightAxisControllerIsActive=0.0,
+            m_anEngineIsRunning=0.0,
+        )
+        client = StubRFLinkClient([initial, moved])
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=THROTTLE_HOVER_TASK,
+            client_factory=lambda: client,
+            reset_poll_interval_seconds=0.0,
+        )
+
+        reset_observation, reset_info = env.reset()
+        observation, _, _, _, info = env.step(
+            np.asarray([0.0, 0.0, 0.7, 0.0], dtype=np.float32)
+        )
+
+        np.testing.assert_allclose(
+            reset_observation,
+            [-0.2 / 1.5, 0.0],
+        )
+        np.testing.assert_allclose(
+            observation,
+            [-0.1 / 1.5, 0.1],
+        )
+        self.assertEqual(
+            reset_info["target_hover"]["altitude_agl_m"],
+            1.5,
+        )
+        self.assertEqual(reset_info["target_hover"]["x_m"], 12.0)
+        self.assertEqual(reset_info["target_hover"]["y_m"], -3.0)
+        self.assertAlmostEqual(client.actions[0].throttle, 0.65)
+        self.assertAlmostEqual(
+            info["throttle_hover_features"]["altitude_error_m"],
+            -0.1,
+        )
+        self.assertEqual(
+            info["throttle_hover_features"]["vertical_velocity_mps"],
+            0.5,
+        )
+
+    def test_throttle_observation_uses_only_altitude_and_vertical_velocity(self):
+        observation = throttle_features_to_observation(
+            ThrottleHoverFeatures(
+                altitude_error_m=0.75,
+                vertical_velocity_mps=-2.5,
             ),
             config=RewardConfig(),
         )

@@ -6,7 +6,9 @@ from hoverpilot.training.hover import (
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_RUDDER,
+    REWARD_PROFILE_THROTTLE,
     RudderHoverFeatures,
+    ThrottleHoverFeatures,
     RewardConfig,
     angular_error_deg,
     compute_aileron_hover_features,
@@ -14,6 +16,7 @@ from hoverpilot.training.hover import (
     compute_elevator_recovery_target_deg,
     compute_reward,
     compute_rudder_hover_features,
+    compute_throttle_hover_features,
     compute_termination,
     project_onto_target_heading,
     signed_vertical_inclination_error_deg,
@@ -317,6 +320,48 @@ class HoverTrainingTests(unittest.TestCase):
 
         self.assertEqual(features.rudder_angle_error_deg, 7.5)
         self.assertEqual(features.yaw_rate_deg_s, -12.0)
+
+    def test_throttle_reward_penalizes_altitude_and_vertical_velocity(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_THROTTLE,
+            boundary_proximity_weight=2.0,
+        )
+
+        balanced = compute_reward(
+            self._state(),
+            config,
+            throttle_features=ThrottleHoverFeatures(0.0, 0.0),
+        )
+        high = compute_reward(
+            self._state(),
+            config,
+            throttle_features=ThrottleHoverFeatures(1.5, 0.0),
+        )
+        climbing = compute_reward(
+            self._state(),
+            config,
+            throttle_features=ThrottleHoverFeatures(0.0, 5.0),
+        )
+
+        self.assertEqual(balanced.altitude_penalty, 0.0)
+        self.assertEqual(balanced.velocity_penalty, 0.0)
+        self.assertEqual(balanced.boundary_proximity_penalty, 0.0)
+        self.assertAlmostEqual(high.altitude_penalty, 1.0)
+        self.assertAlmostEqual(climbing.velocity_penalty, 0.5)
+        self.assertLess(high.reward, balanced.reward)
+        self.assertLess(climbing.reward, balanced.reward)
+
+    def test_throttle_features_use_agl_error_and_upward_positive_velocity(self):
+        features = compute_throttle_hover_features(
+            self._state(
+                m_altitudeAGL_MTR=2.0,
+                m_velocityWorldW_MPS=-3.0,
+            ),
+            target_altitude_agl_m=1.5,
+        )
+
+        self.assertEqual(features.altitude_error_m, 0.5)
+        self.assertEqual(features.vertical_velocity_mps, 3.0)
 
     def test_elevator_recovery_target_is_symmetric_and_bounded(self):
         self.assertEqual(

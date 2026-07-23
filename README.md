@@ -364,6 +364,34 @@ the next episode because rudder-only hover does not produce a normal
 crash/reset boundary. A new rudder episode must begin within 5° of vertical;
 the reconnect state becomes the zero reference for the integrated angle.
 
+For an Airplane Hover Trainer configuration where only throttle is enabled,
+use the one-dimensional throttle mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode throttle \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_throttle.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-throttle \
+  --seed 42
+```
+
+Throttle mode keeps the AGL target fixed at `1.5 m` across episode reconnects.
+It observes only target-relative AGL error and vertical velocity; RealFlight's
+down-positive world-W velocity is converted to an up-positive value. The
+reward penalizes squared normalized altitude error, vertical velocity, and
+throttle changes. Planar boundary, attitude, and unrelated-axis terms are
+excluded.
+
+The actor is a minimal hover trim plus two learned positive gains:
+`trim - k_altitude × altitude_error - k_velocity × vertical_velocity`.
+Positive altitude or upward velocity therefore reduces throttle, while
+negative altitude or downward velocity increases it. The throttle output is
+bounded directly to `[0, 1]`.
+
+Throttle-only hover also uses deliberate RFLink close/reconnect boundaries at
+each 300-step time limit. Reconnecting does not re-anchor the altitude target,
+so accumulated height drift cannot be hidden by starting a new episode.
+
 For a RealFlight Hover Trainer configuration where PPO controls only elevator,
 use a one-dimensional policy and keep the other transmitted channels fixed:
 

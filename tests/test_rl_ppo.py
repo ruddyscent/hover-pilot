@@ -35,6 +35,7 @@ else:
         CONTROL_MODE_ALL,
         CONTROL_MODE_ELEVATOR,
         CONTROL_MODE_RUDDER,
+        CONTROL_MODE_THROTTLE,
         POLICY_PRESET_ELEVATOR_PD,
         POLICY_PRESET_NONE,
         PPO_CHECKPOINT_FORMAT,
@@ -402,6 +403,89 @@ class PPOTrainingModuleTests(unittest.TestCase):
             {
                 "rudder_angle_error_scale_deg": 12.0,
                 "yaw_rate_scale_deg_s": 45.0,
+            },
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_throttle_policy_is_bounded_and_always_restoring_around_trim(self):
+        model = ActorCritic(
+            2,
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_THROTTLE,
+        )
+        positive = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        negative = -positive
+
+        positive_action = model.deterministic_action(positive)
+        negative_action = model.deterministic_action(negative)
+        trim = model.throttle_policy_trim
+
+        self.assertIsNotNone(trim)
+        self.assertTrue(torch.all(positive_action < trim))
+        self.assertTrue(torch.all(negative_action > trim))
+        self.assertTrue(torch.all(positive_action >= 0.0))
+        self.assertTrue(torch.all(negative_action <= 1.0))
+
+        with torch.no_grad():
+            model.throttle_policy_raw_gain.fill_(-5.0)
+        still_restoring = model.deterministic_action(positive)
+        self.assertTrue(torch.all(still_restoring < trim))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_throttle_action_expands_to_only_throttle(self):
+        policy_space = gym.spaces.Box(
+            low=np.asarray([0.0], dtype=np.float32),
+            high=np.asarray([1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        action = _expand_policy_action(
+            np.asarray([0.7], dtype=np.float32),
+            policy_space,
+            CONTROL_MODE_THROTTLE,
+            0.2,
+        )
+
+        np.testing.assert_allclose(action, [0.0, 0.0, 0.7, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_throttle_checkpoint_round_trip_preserves_observation_scales(self):
+        model = ActorCritic(
+            2,
+            np.asarray([0.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_THROTTLE,
+        )
+        reward_config = RewardConfig(
+            altitude_error_scale_m=2.0,
+            velocity_error_scale_mps=4.0,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/throttle.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_THROTTLE,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            loaded = load_policy_checkpoint(checkpoint_path)
+
+        self.assertEqual(loaded.control_mode, CONTROL_MODE_THROTTLE)
+        self.assertEqual(
+            loaded.observation_config,
+            {
+                "altitude_error_scale_m": 2.0,
+                "velocity_error_scale_mps": 4.0,
             },
         )
 
