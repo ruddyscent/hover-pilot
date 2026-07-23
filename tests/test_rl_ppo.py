@@ -14,6 +14,8 @@ except ImportError as exc:
     torch = None
     PPOConfig = None
     PPOTrainer = None
+    PPOPlayConfig = None
+    PPOPlayer = None
     ActorCritic = None
     RolloutBuffer = None
     build_policy_checkpoint = None
@@ -34,6 +36,8 @@ else:
         POLICY_PRESET_NONE,
         PPO_CHECKPOINT_FORMAT,
         PPO_CHECKPOINT_VERSION,
+        PPOPlayConfig,
+        PPOPlayer,
         PPOConfig,
         PPOTrainer,
         RolloutBuffer,
@@ -70,6 +74,62 @@ class ResetWaitEnv:
             "episode_start_reason": "trainer_repositioned",
         }
         return True, observation, info
+
+
+class PlayEnv(gym.Env if gym is not None else object):
+    def __init__(self, episode_steps=2):
+        self.observation_space = gym.spaces.Box(
+            low=-5.0,
+            high=5.0,
+            shape=(13,),
+            dtype=np.float32,
+        )
+        self.action_space = gym.spaces.Box(
+            low=np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32),
+            high=np.ones(4, dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.episode_steps = episode_steps
+        self.steps = 0
+        self.actions = []
+        self.closed = False
+
+    def reset(self, *, seed=None, options=None):
+        del seed, options
+        self.steps = 0
+        return np.zeros(self.observation_space.shape, dtype=np.float32), {
+            "episode_start_reason": "test_reset",
+            "waiting_for_reset": False,
+        }
+
+    def step(self, action):
+        self.actions.append(np.asarray(action, dtype=np.float32))
+        self.steps += 1
+        terminated = self.steps >= self.episode_steps
+        return (
+            np.zeros(self.observation_space.shape, dtype=np.float32),
+            1.0,
+            terminated,
+            False,
+            {
+                "termination_reason": "test_end" if terminated else None,
+                "debug_state": {},
+            },
+        )
+
+    def close(self):
+        self.closed = True
+
+
+class CompactPlayEnv(PlayEnv):
+    def __init__(self, episode_steps=2):
+        super().__init__(episode_steps=episode_steps)
+        self.observation_space = gym.spaces.Box(
+            low=-5.0,
+            high=5.0,
+            shape=(6,),
+            dtype=np.float32,
+        )
 
 
 class PPOTrainingModuleTests(unittest.TestCase):
@@ -549,6 +609,14 @@ class PPOTrainingModuleTests(unittest.TestCase):
         self.assertEqual(args.policy_preset, POLICY_PRESET_ELEVATOR_PD)
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_play_cli_defaults_to_checkpoint_inference_until_interrupted(self):
+        args = parse_args(["play", "--checkpoint", "policy.pt"])
+
+        self.assertEqual(args.checkpoint, "policy.pt")
+        self.assertEqual(args.episodes, 0)
+        self.assertEqual(args.device, "auto")
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_diagnose_elevator_cli_uses_conservative_pulse_defaults(self):
         args = parse_args(["diagnose-elevator"])
 
@@ -696,6 +764,90 @@ class PPOTrainingModuleTests(unittest.TestCase):
         )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_player_loads_checkpoint_and_sends_deterministic_actions(self):
+        model = ActorCritic(
+            6,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+        )
+
+        class TestPlayer(PPOPlayer):
+            def _build_env(self):
+                return CompactPlayEnv(episode_steps=2)
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/elevator.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_ELEVATOR,
+                    elevator_fixed_throttle=0.62,
+                    reward_config=RewardConfig(),
+                ),
+                checkpoint_path,
+            )
+            player = TestPlayer(
+                PPOPlayConfig(
+                    checkpoint_path=checkpoint_path,
+                    episodes=1,
+                    log_interval_steps=0,
+                    device="cpu",
+                )
+            )
+
+            player.play()
+
+        self.assertEqual(player.control_mode, CONTROL_MODE_ELEVATOR)
+        self.assertEqual(player.env.observation_space.shape, (6,))
+        self.assertEqual(len(player.env.actions), 2)
+        for action in player.env.actions:
+            np.testing.assert_allclose(
+                action,
+                np.asarray([0.0, 0.0, 0.62, 0.0], dtype=np.float32),
+                atol=1.0e-5,
+            )
+        self.assertTrue(player.env.closed)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_player_builds_real_env_with_checkpoint_observation_config(self):
+        model = ActorCritic(
+            6,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+        )
+        reward_config = RewardConfig(
+            inclination_error_scale_deg=11.0,
+            elevator_recovery_velocity_gain_deg_per_mps=4.5,
+        )
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/elevator.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_ELEVATOR,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            player = PPOPlayer(
+                PPOPlayConfig(
+                    checkpoint_path=checkpoint_path,
+                    device="cpu",
+                )
+            )
+
+        self.assertEqual(
+            player.env.reward_config.inclination_error_scale_deg,
+            11.0,
+        )
+        self.assertEqual(
+            player.env.reward_config.elevator_recovery_velocity_gain_deg_per_mps,
+            4.5,
+        )
+        player.env.close()
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_reward_scale_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "reward_scale must be greater than zero"):
             PPOTrainer(PPOConfig(reward_scale=0.0, tensorboard_log_dir=None))
@@ -757,6 +909,129 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 list(Path(directory).glob("policy.pt.tmp-*")),
                 [],
             )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_structured_checkpoint_round_trip_preserves_pd_policy_action(self):
+        class TestPlayer(PPOPlayer):
+            def _build_env(self):
+                return CompactPlayEnv(episode_steps=1)
+
+        observation = torch.tensor(
+            [[0.6, -0.2, 0.3, 0.1, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        with TemporaryDirectory() as directory:
+            save_path = f"{directory}/policy.pt"
+            trainer = PPOTrainer(
+                PPOConfig(
+                    control_mode=CONTROL_MODE_ELEVATOR,
+                    policy_preset=POLICY_PRESET_ELEVATOR_PD,
+                    elevator_fixed_throttle=0.61,
+                    save_path=save_path,
+                    tensorboard_log_dir=None,
+                    seed=42,
+                )
+            )
+            with torch.no_grad():
+                trainer.model.policy_prior_weight.mul_(0.8)
+                trainer.model._policy_prior_limit.fill_(0.4)
+                trainer.model._policy_residual_limit.fill_(0.15)
+            expected_action = trainer.model.deterministic_action(observation)
+            trainer._save_model(step=321, reason="test")
+
+            loaded = load_policy_checkpoint(save_path)
+            player = TestPlayer(
+                PPOPlayConfig(
+                    checkpoint_path=save_path,
+                    device="cpu",
+                )
+            )
+            actual_action = player.model.deterministic_action(observation)
+
+        self.assertEqual(loaded.control_mode, CONTROL_MODE_ELEVATOR)
+        self.assertEqual(loaded.policy_preset, POLICY_PRESET_ELEVATOR_PD)
+        self.assertEqual(loaded.elevator_fixed_throttle, 0.61)
+        torch.testing.assert_close(
+            player.model.policy_prior_weight,
+            trainer.model.policy_prior_weight,
+        )
+        self.assertAlmostEqual(player.model.policy_prior_limit, 0.4)
+        self.assertAlmostEqual(player.model.policy_residual_limit, 0.15)
+        expected_env_action = np.asarray(
+            [0.0, expected_action[0, 0].item(), 0.61, 0.0],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(
+            player._to_env_action(actual_action.detach().numpy()[0]),
+            expected_env_action,
+            atol=1.0e-6,
+        )
+        torch.testing.assert_close(actual_action, expected_action.cpu())
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_structured_checkpoint_round_trip_preserves_pure_policy_and_observation_config(self):
+        class TestPlayer(PPOPlayer):
+            def _build_env(self):
+                return CompactPlayEnv(episode_steps=1)
+
+        reward_config = RewardConfig(
+            inclination_error_scale_deg=12.0,
+            pitch_rate_scale_deg_s=24.0,
+            longitudinal_position_scale_m=3.0,
+            altitude_error_scale_m=2.0,
+            velocity_error_scale_mps=4.0,
+            elevator_recovery_position_gain_deg_per_m=2.5,
+            elevator_recovery_velocity_gain_deg_per_mps=3.5,
+            elevator_recovery_inclination_limit_deg=25.0,
+        )
+        observation = torch.tensor(
+            [[0.6, -0.2, 0.3, 0.1, 0.0, 0.0]],
+            dtype=torch.float32,
+        )
+        with TemporaryDirectory() as directory:
+            save_path = f"{directory}/policy.pt"
+            trainer = PPOTrainer(
+                PPOConfig(
+                    control_mode=CONTROL_MODE_ELEVATOR,
+                    reward_config=reward_config,
+                    save_path=save_path,
+                    tensorboard_log_dir=None,
+                    seed=42,
+                )
+            )
+            with torch.no_grad():
+                trainer.model.elevator_policy_raw_gain.add_(0.2)
+            expected_action = trainer.model.deterministic_action(observation)
+            expected_value = trainer.model(observation)[2]
+            trainer._save_model(step=321, reason="test")
+
+            loaded = load_policy_checkpoint(save_path)
+            player = TestPlayer(
+                PPOPlayConfig(
+                    checkpoint_path=save_path,
+                    device="cpu",
+                )
+            )
+            actual_action = player.model.deterministic_action(observation)
+            actual_value = player.model(observation)[2]
+
+        self.assertEqual(loaded.policy_preset, POLICY_PRESET_NONE)
+        self.assertEqual(
+            loaded.observation_config[
+                "elevator_recovery_position_gain_deg_per_m"
+            ],
+            2.5,
+        )
+        self.assertEqual(
+            player.reward_config.elevator_recovery_velocity_gain_deg_per_mps,
+            3.5,
+        )
+        torch.testing.assert_close(
+            player.model.elevator_policy_raw_gain,
+            trainer.model.elevator_policy_raw_gain,
+        )
+        torch.testing.assert_close(actual_action, expected_action.cpu())
+        torch.testing.assert_close(actual_value, expected_value.cpu())
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_episode_metrics_span_rollout_boundaries(self):

@@ -125,6 +125,23 @@ class PPOConfig:
     checkpoint_interval_steps: int = 1024
 
 
+@dataclass
+class PPOPlayConfig:
+    checkpoint_path: str
+    host: str = HOST
+    port: int = PORT
+    max_episode_steps: Optional[int] = 300
+    sleep_interval_s: float = 0.0
+    device: str = "auto"
+    episodes: int = 0
+    log_interval_steps: int = 25
+    initial_action: Tuple[float, float, float, float] = DEFAULT_INITIAL_ACTION
+    wait_action: Tuple[float, float, float, float] = DEFAULT_WAIT_ACTION
+    rflink_socket_timeout_s: float = 3.0
+    rflink_request_attempts: int = 4
+    rflink_retry_backoff_s: float = 0.1
+
+
 @dataclass(frozen=True)
 class PPOCheckpoint:
     model_state_dict: Mapping[str, torch.Tensor]
@@ -135,7 +152,7 @@ class PPOCheckpoint:
 
 
 def _build_hover_env(
-    config: PPOConfig,
+    config: Union[PPOConfig, PPOPlayConfig],
     control_mode: str,
     reward_config: Optional[RewardConfig] = None,
 ) -> HoverPilotHoverEnv:
@@ -161,7 +178,7 @@ def _build_hover_env(
 
 
 def _validate_rflink_settings(
-    config: PPOConfig,
+    config: Union[PPOConfig, PPOPlayConfig],
 ) -> None:
     if config.rflink_socket_timeout_s <= 0.0:
         raise ValueError("rflink_socket_timeout_s must be greater than zero")
@@ -1717,6 +1734,147 @@ class PPOTrainer:
             )
 
 
+class PPOPlayer:
+    def __init__(self, config: PPOPlayConfig):
+        if config.episodes < 0:
+            raise ValueError("episodes must be non-negative; use 0 to run until interrupted")
+        if config.log_interval_steps < 0:
+            raise ValueError("log_interval_steps must be non-negative")
+        _validate_rflink_settings(config)
+
+        self.config = config
+        self.device = resolve_device(config.device)
+        checkpoint = load_policy_checkpoint(config.checkpoint_path)
+        self.control_mode = checkpoint.control_mode
+        self.policy_preset = checkpoint.policy_preset
+        self.elevator_fixed_throttle = (
+            checkpoint.elevator_fixed_throttle
+        )
+        self.reward_config = _apply_observation_config(
+            RewardConfig(),
+            checkpoint.observation_config,
+        )
+        self.env = self._build_env()
+        self.policy_action_space = _policy_action_space(
+            self.control_mode,
+            self.env.action_space,
+        )
+        observation_dim = int(np.prod(self.env.observation_space.shape))
+        self.model = ActorCritic(
+            observation_dim,
+            self.policy_action_space.low,
+            self.policy_action_space.high,
+            policy_preset=self.policy_preset,
+        ).to(self.device)
+        try:
+            self.model.load_state_dict(checkpoint.model_state_dict, strict=True)
+        except RuntimeError as exc:
+            self.env.close()
+            raise ValueError(
+                "PPO checkpoint is incompatible with the current HoverPilot policy architecture: "
+                f"{exc}"
+            ) from exc
+        self.model.eval()
+
+    def _build_env(self) -> gym.Env:
+        return _build_hover_env(
+            self.config,
+            self.control_mode,
+            reward_config=self.reward_config,
+        )
+
+    def _to_env_action(self, policy_action: np.ndarray) -> np.ndarray:
+        return _expand_policy_action(
+            policy_action,
+            self.policy_action_space,
+            self.control_mode,
+            self.elevator_fixed_throttle,
+        )
+
+    def _initial_action(self) -> np.ndarray:
+        return _initial_env_action(
+            self.control_mode,
+            self.elevator_fixed_throttle,
+            self.config.initial_action,
+        )
+
+    def _wait_action(self) -> np.ndarray:
+        return np.asarray(self.config.wait_action, dtype=np.float32)
+
+    def play(self):
+        completed_episodes = 0
+        total_steps = 0
+        checkpoint_path = os.path.abspath(os.path.expanduser(self.config.checkpoint_path))
+        episode_limit = "unlimited" if self.config.episodes == 0 else str(self.config.episodes)
+        print(
+            f"[PLAY] Loaded checkpoint={checkpoint_path} device={self.device.type} "
+            f"control_mode={self.control_mode} policy_preset={self.policy_preset} "
+            f"fixed_throttle={self.elevator_fixed_throttle:.3f} "
+            f"episodes={episode_limit}"
+        )
+
+        try:
+            next_segment = None
+            while self.config.episodes == 0 or completed_episodes < self.config.episodes:
+                if next_segment is None:
+                    observation, info = reset_env_with_wait(
+                        self.env,
+                        action=self._wait_action(),
+                        initial_action=self._initial_action(),
+                    )
+                else:
+                    observation, info = next_segment
+                    next_segment = None
+                episode_reward = 0.0
+                episode_steps = 0
+                print(
+                    f"[PLAY] episode={completed_episodes + 1} start "
+                    f"reason={info.get('episode_start_reason')}"
+                )
+
+                while True:
+                    obs_tensor = torch.as_tensor(
+                        observation,
+                        dtype=torch.float32,
+                        device=self.device,
+                    ).unsqueeze(0)
+                    with torch.inference_mode():
+                        action_tensor = self.model.deterministic_action(obs_tensor)
+                    policy_action = action_tensor.squeeze(0).cpu().numpy()
+                    env_action = self._to_env_action(policy_action)
+                    observation, reward, terminated, truncated, info = self.env.step(env_action)
+                    total_steps += 1
+                    episode_steps += 1
+                    episode_reward += float(reward)
+
+                    if (
+                        self.config.log_interval_steps > 0
+                        and total_steps % self.config.log_interval_steps == 0
+                    ):
+                        print(
+                            f"[PLAY] step={total_steps} episode_step={episode_steps} "
+                            f"reward={float(reward):+.3f} action={env_action.tolist()} "
+                            f"state={format_debug_state(info.get('debug_state'))}"
+                        )
+
+                    if terminated or truncated:
+                        reason = info.get("termination_reason") or (
+                            "truncated" if truncated else "unknown"
+                        )
+                        completed_episodes += 1
+                        print(
+                            f"[PLAY] episode={completed_episodes} end steps={episode_steps} "
+                            f"reward={episode_reward:+.3f} reason={reason}"
+                        )
+                        if truncated:
+                            next_segment = continue_env_after_truncation(self.env)
+                        break
+        except KeyboardInterrupt:
+            print(f"\n[PLAY] Interrupted after episodes={completed_episodes} steps={total_steps}")
+        finally:
+            self.env.close()
+
+
 def reset_env_with_wait(
     env: gym.Env,
     *,
@@ -1796,7 +1954,7 @@ def _add_rflink_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train or diagnose PPO policies on the HoverPilot Hover Env."
+        description="Train, play, or diagnose PPO policies on the HoverPilot Hover Env."
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
@@ -1911,6 +2069,37 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     _add_rflink_args(train_parser)
 
+    play_parser = subparsers.add_parser(
+        "play",
+        help="Control Airplane Hover Trainer with a saved PPO checkpoint",
+    )
+    play_parser.add_argument(
+        "--checkpoint",
+        required=True,
+        help="Path to a HoverPilot PPO .pt checkpoint.",
+    )
+    play_parser.add_argument(
+        "--episodes",
+        type=int,
+        default=0,
+        help="Number of episodes to run; 0 runs until interrupted.",
+    )
+    play_parser.add_argument("--max-episode-steps", type=int, default=300)
+    play_parser.add_argument("--sleep-interval-s", type=float, default=0.0)
+    play_parser.add_argument(
+        "--log-interval-steps",
+        type=int,
+        default=25,
+        help="Print policy action and state every N steps; 0 disables step logs.",
+    )
+    play_parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda", "mps"),
+        default="auto",
+        help="Inference device. auto selects CUDA when available and otherwise CPU; MPS is opt-in.",
+    )
+    _add_rflink_args(play_parser)
+
     diagnose_parser = subparsers.add_parser(
         "diagnose-elevator",
         help="Measure RealFlight pitch response to conservative elevator pulses",
@@ -1964,6 +2153,23 @@ def main(argv: Optional[List[str]] = None):
         )
         trainer = PPOTrainer(config)
         trainer.train()
+    elif args.command == "play":
+        player = PPOPlayer(
+            PPOPlayConfig(
+                checkpoint_path=args.checkpoint,
+                host=args.host,
+                port=args.port,
+                max_episode_steps=args.max_episode_steps,
+                sleep_interval_s=args.sleep_interval_s,
+                device=args.device,
+                episodes=args.episodes,
+                log_interval_steps=args.log_interval_steps,
+                rflink_socket_timeout_s=args.rflink_socket_timeout_s,
+                rflink_request_attempts=args.rflink_request_attempts,
+                rflink_retry_backoff_s=args.rflink_retry_backoff_s,
+            )
+        )
+        player.play()
     elif args.command == "diagnose-elevator":
         diagnose_elevator_response(
             args.host,

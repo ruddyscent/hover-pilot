@@ -403,6 +403,26 @@ preset and fixed throttle take precedence over their command-line defaults.
 The optimizer is recreated with the command's current learning rate and tuning
 options.
 
+Run a trained checkpoint against Airplane Hover Trainer:
+
+```bash
+uv run hoverpilot-ppo play --checkpoint ppo_hoverpilot.pt
+```
+
+`play` loads the checkpoint, runs deterministic policy inference, and sends the
+resulting aileron, elevator, throttle, and rudder commands through RealFlight
+Link. It continues across trainer resets until you press `Ctrl+C`. To run a fixed
+number of episodes instead:
+
+```bash
+uv run hoverpilot-ppo play \
+  --checkpoint ppo_hoverpilot_elevator.pt \
+  --episodes 3
+```
+
+`play` always uses the control mode and fixed throttle recorded in the
+checkpoint. For an elevator checkpoint, aileron and rudder remain neutral.
+
 Training writes TensorBoard logs to `runs/hoverpilot-ppo` by default.
 
 List all training options with:
