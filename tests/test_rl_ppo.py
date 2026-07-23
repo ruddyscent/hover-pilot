@@ -32,6 +32,7 @@ else:
     from hoverpilot.rl.ppo import (
         ActorCritic,
         CONTROL_MODE_AILERON,
+        CONTROL_MODE_AILERON_THROTTLE,
         CONTROL_MODE_ALL,
         CONTROL_MODE_ELEVATOR,
         CONTROL_MODE_ELEVATOR_THROTTLE,
@@ -505,6 +506,111 @@ class PPOTrainingModuleTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(action, [0.0, 0.0, 0.65, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_throttle_policy_has_independent_restoring_channels(self):
+        model = ActorCritic(
+            4,
+            np.asarray([-1.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_AILERON_THROTTLE,
+        )
+        actions = model.deterministic_action(
+            torch.eye(4, dtype=torch.float32)
+        ).detach()
+        self.assertIsNotNone(model.aileron_policy_trim)
+        self.assertIsNotNone(model.throttle_policy_trim)
+        aileron_trim = model.aileron_policy_trim.detach()
+        throttle_trim = model.throttle_policy_trim.detach()
+
+        self.assertEqual(tuple(actions.shape), (4, 2))
+        self.assertLess(float(actions[0, 0]), float(aileron_trim))
+        self.assertLess(float(actions[1, 0]), float(aileron_trim))
+        self.assertAlmostEqual(
+            float(actions[2, 0]),
+            float(aileron_trim),
+        )
+        self.assertAlmostEqual(
+            float(actions[3, 0]),
+            float(aileron_trim),
+        )
+        self.assertLess(float(actions[2, 1]), float(throttle_trim))
+        self.assertLess(float(actions[3, 1]), float(throttle_trim))
+        self.assertAlmostEqual(
+            float(actions[0, 1]),
+            float(throttle_trim),
+        )
+        self.assertAlmostEqual(
+            float(actions[1, 1]),
+            float(throttle_trim),
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_throttle_action_expands_to_only_enabled_channels(self):
+        policy_space = gym.spaces.Box(
+            low=np.asarray([-1.0, 0.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        action = _expand_policy_action(
+            np.asarray([0.25, 0.7], dtype=np.float32),
+            policy_space,
+            CONTROL_MODE_AILERON_THROTTLE,
+            0.2,
+        )
+
+        np.testing.assert_allclose(action, [0.25, 0.0, 0.7, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_throttle_initial_action_uses_both_hover_trims(self):
+        action = _initial_env_action(
+            CONTROL_MODE_AILERON_THROTTLE,
+            0.2,
+            (0.0, 0.0, 0.55, 0.0),
+        )
+
+        np.testing.assert_allclose(action, [0.78, 0.0, 0.65, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_throttle_checkpoint_preserves_all_observation_scales(self):
+        model = ActorCritic(
+            4,
+            np.asarray([-1.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_AILERON_THROTTLE,
+        )
+        reward_config = RewardConfig(
+            roll_error_scale_deg=22.0,
+            roll_rate_scale_deg_s=75.0,
+            altitude_error_scale_m=2.0,
+            velocity_error_scale_mps=4.0,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/aileron-throttle.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_AILERON_THROTTLE,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            loaded = load_policy_checkpoint(checkpoint_path)
+
+        self.assertEqual(
+            loaded.observation_config,
+            {
+                "roll_error_scale_deg": 22.0,
+                "roll_rate_scale_deg_s": 75.0,
+                "altitude_error_scale_m": 2.0,
+                "velocity_error_scale_mps": 4.0,
+            },
+        )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_throttle_checkpoint_round_trip_preserves_observation_scales(self):

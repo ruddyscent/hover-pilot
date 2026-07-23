@@ -2,7 +2,9 @@ import unittest
 
 from hoverpilot.rflink.models import FlightAxisState
 from hoverpilot.training.hover import (
+    AileronHoverFeatures,
     REWARD_PROFILE_AILERON,
+    REWARD_PROFILE_AILERON_THROTTLE,
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_RUDDER,
@@ -392,6 +394,34 @@ class HoverTrainingTests(unittest.TestCase):
         self.assertGreater(disturbed.angular_rate_penalty, 0.0)
         self.assertGreater(disturbed.velocity_penalty, 0.0)
         self.assertGreater(disturbed.action_smoothness_penalty, 0.0)
+        self.assertLess(disturbed.reward, balanced.reward)
+
+    def test_aileron_throttle_reward_penalizes_both_state_and_control_changes(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_AILERON_THROTTLE,
+        )
+        balanced = compute_reward(
+            self._state(),
+            config,
+            aileron_features=AileronHoverFeatures(0.0, 0.0),
+            throttle_features=ThrottleHoverFeatures(0.0, 0.0),
+        )
+        disturbed = compute_reward(
+            self._state(),
+            config,
+            aileron_delta=0.4,
+            throttle_delta=0.2,
+            aileron_features=AileronHoverFeatures(15.0, 30.0),
+            throttle_features=ThrottleHoverFeatures(0.75, -2.5),
+        )
+
+        self.assertEqual(disturbed.position_penalty, 0.0)
+        self.assertGreater(disturbed.altitude_penalty, 0.0)
+        self.assertGreater(disturbed.attitude_penalty, 0.0)
+        self.assertGreater(disturbed.angular_rate_penalty, 0.0)
+        self.assertGreater(disturbed.velocity_penalty, 0.0)
+        self.assertGreater(disturbed.action_smoothness_penalty, 0.0)
+        self.assertEqual(disturbed.boundary_proximity_penalty, 0.0)
         self.assertLess(disturbed.reward, balanced.reward)
 
     def test_elevator_recovery_target_is_symmetric_and_bounded(self):

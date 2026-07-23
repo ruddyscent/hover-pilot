@@ -4,6 +4,7 @@ import numpy as np
 
 from hoverpilot.envs import (
     AILERON_HOVER_TASK,
+    AILERON_THROTTLE_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
     ELEVATOR_THROTTLE_HOVER_TASK,
     HoverPilotHoverEnv,
@@ -11,6 +12,7 @@ from hoverpilot.envs import (
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     aileron_features_to_observation,
+    aileron_throttle_features_to_observation,
     elevator_features_to_observation,
     elevator_throttle_features_to_observation,
     gym_action_to_rf_action,
@@ -328,6 +330,71 @@ class HoverEnvTests(unittest.TestCase):
         )
 
         np.testing.assert_allclose(observation, [0.5, -0.5])
+
+    def test_aileron_throttle_observation_combines_only_enabled_axes(self):
+        observation = aileron_throttle_features_to_observation(
+            AileronHoverFeatures(
+                roll_error_deg=15.0,
+                roll_rate_deg_s=-30.0,
+            ),
+            ThrottleHoverFeatures(
+                altitude_error_m=0.75,
+                vertical_velocity_mps=-2.5,
+            ),
+            config=RewardConfig(),
+        )
+
+        np.testing.assert_allclose(
+            observation,
+            [0.5, -0.5, 0.5, -0.5],
+        )
+
+    def test_aileron_throttle_targets_survive_connection_episode_boundary(self):
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=AILERON_THROTTLE_HOVER_TASK,
+            client_factory=lambda: StubRFLinkClient([]),
+        )
+        first = self._state(
+            m_aircraftPositionX_MTR=12.0,
+            m_aircraftPositionY_MTR=-3.0,
+            m_altitudeAGL_MTR=2.0,
+            m_inclination_DEG=90.0,
+            m_roll_DEG=7.0,
+        )
+        drifted = self._state(
+            m_aircraftPositionX_MTR=14.0,
+            m_aircraftPositionY_MTR=-4.0,
+            m_altitudeAGL_MTR=3.0,
+            m_inclination_DEG=90.0,
+            m_roll_DEG=12.0,
+        )
+        repositioned = self._state(
+            m_aircraftPositionX_MTR=1.0,
+            m_aircraftPositionY_MTR=2.0,
+            m_altitudeAGL_MTR=1.8,
+            m_inclination_DEG=90.0,
+            m_roll_DEG=-4.0,
+        )
+
+        env._start_episode_from_state(first, "reset_ready")
+        env._start_episode_from_state(drifted, "reset_ready")
+
+        self.assertEqual(env.reward_config.target_x_m, 12.0)
+        self.assertEqual(env.reward_config.target_y_m, -3.0)
+        self.assertEqual(env.reward_config.target_altitude_agl_m, 2.0)
+        self.assertEqual(env.reward_config.target_roll_deg, 7.0)
+
+        env._start_episode_from_state(
+            repositioned,
+            "trainer_repositioned",
+        )
+
+        self.assertEqual(env.reward_config.target_x_m, 1.0)
+        self.assertEqual(env.reward_config.target_y_m, 2.0)
+        self.assertEqual(env.reward_config.target_altitude_agl_m, 1.8)
+        self.assertEqual(env.reward_config.target_roll_deg, -4.0)
 
     def test_elevator_throttle_observation_uses_upward_positive_velocity(self):
         observation = elevator_throttle_features_to_observation(

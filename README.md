@@ -392,6 +392,29 @@ Throttle-only hover also uses deliberate RFLink close/reconnect boundaries at
 each 300-step time limit. Reconnecting does not re-anchor the altitude target,
 so accumulated height drift cannot be hidden by starting a new episode.
 
+For an Airplane Hover Trainer configuration where only aileron and throttle
+are enabled, use the two-dimensional combined mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode aileron-throttle \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_aileron_throttle.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-aileron-throttle \
+  --seed 42
+```
+
+This mode observes wrapped roll error, roll rate, target-relative AGL, and
+up-positive vertical velocity. Its two structured actor outputs independently
+apply the aileron trim and restoring roll gains, and the throttle hover trim
+and restoring altitude gains. Elevator and rudder remain neutral. The reward
+contains only roll, roll-rate, altitude, vertical-velocity, and enabled-action
+smoothness terms.
+
+Because this trainer configuration has no normal collision/reset boundary,
+each 300-step limit closes and reconnects RFLink. The initial roll and AGL
+targets survive deliberate reconnects so drift is not hidden; an actual
+trainer reposition establishes new targets.
+
 For an Airplane Hover Trainer configuration where only elevator and throttle
 are enabled, use the two-dimensional combined mode:
 

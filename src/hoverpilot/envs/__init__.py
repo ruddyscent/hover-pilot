@@ -1,5 +1,6 @@
 from hoverpilot.envs.hover_env import (
     AILERON_HOVER_TASK,
+    AILERON_THROTTLE_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
     ELEVATOR_THROTTLE_HOVER_TASK,
     EpisodeLifecycleResult,
@@ -9,6 +10,7 @@ from hoverpilot.envs.hover_env import (
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     aileron_features_to_observation,
+    aileron_throttle_features_to_observation,
     elevator_features_to_observation,
     elevator_throttle_features_to_observation,
     gym_action_to_rf_action,
@@ -19,6 +21,7 @@ from hoverpilot.envs.hover_env import (
 
 __all__ = [
     "AILERON_HOVER_TASK",
+    "AILERON_THROTTLE_HOVER_TASK",
     "ELEVATOR_HOVER_TASK",
     "ELEVATOR_THROTTLE_HOVER_TASK",
     "EpisodeLifecycleResult",
@@ -28,6 +31,7 @@ __all__ = [
     "STANDARD_HOVER_TASK",
     "THROTTLE_HOVER_TASK",
     "aileron_features_to_observation",
+    "aileron_throttle_features_to_observation",
     "elevator_features_to_observation",
     "elevator_throttle_features_to_observation",
     "gym_action_to_rf_action",
