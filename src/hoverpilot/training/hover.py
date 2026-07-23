@@ -7,6 +7,7 @@ from hoverpilot.rflink.models import FlightAxisState
 
 REWARD_PROFILE_STANDARD = "standard"
 REWARD_PROFILE_ELEVATOR = "elevator"
+REWARD_PROFILE_AILERON = "aileron"
 STANDARD_HOVER_INCLINATION_DEG = 0.0
 REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
 
@@ -34,6 +35,11 @@ class RewardConfig:
     pitch_rate_weight: float = 0.5
     velocity_error_weight: float = 0.2
     elevator_smoothness_weight: float = 0.01
+    aileron_roll_error_weight: float = 1.0
+    aileron_roll_rate_weight: float = 0.5
+    aileron_smoothness_weight: float = 0.01
+    roll_error_scale_deg: float = 30.0
+    roll_rate_scale_deg_s: float = 60.0
     inclination_error_scale_deg: float = 15.0
     pitch_rate_scale_deg_s: float = 30.0
     longitudinal_position_scale_m: float = 4.0
@@ -67,6 +73,8 @@ class RewardConfig:
             ),
             "altitude_error_scale_m": self.altitude_error_scale_m,
             "velocity_error_scale_mps": self.velocity_error_scale_mps,
+            "roll_error_scale_deg": self.roll_error_scale_deg,
+            "roll_rate_scale_deg_s": self.roll_rate_scale_deg_s,
         }
         for name, value in observation_scales.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -97,6 +105,14 @@ class ElevatorHoverFeatures:
     longitudinal_velocity_mps: float
     altitude_error_m: float
     vertical_velocity_mps: float
+
+
+@dataclass(frozen=True)
+class AileronHoverFeatures:
+    """State features that aileron-only hover can directly influence."""
+
+    roll_error_deg: float
+    roll_rate_deg_s: float
 
 
 @dataclass
@@ -182,6 +198,8 @@ def compute_reward(
     ground_contact_duration_s: float = 0.0,
     elevator_delta: float = 0.0,
     elevator_features: Optional[ElevatorHoverFeatures] = None,
+    aileron_delta: float = 0.0,
+    aileron_features: Optional[AileronHoverFeatures] = None,
 ) -> RewardBreakdown:
     termination = compute_termination(
         state,
@@ -190,7 +208,39 @@ def compute_reward(
         ground_contact_duration_s=ground_contact_duration_s,
     )
 
-    if config.profile == REWARD_PROFILE_ELEVATOR:
+    if config.profile == REWARD_PROFILE_AILERON:
+        features = (
+            aileron_features
+            if aileron_features is not None
+            else compute_aileron_hover_features(
+                state,
+                target_roll_deg=config.target_roll_deg,
+            )
+        )
+        position_penalty = 0.0
+        altitude_penalty = 0.0
+        attitude_penalty = config.aileron_roll_error_weight * (
+            _bounded_normalized_square(
+                features.roll_error_deg,
+                config.roll_error_scale_deg,
+                config.max_normalized_error_squared,
+            )
+        )
+        angular_rate_penalty = config.aileron_roll_rate_weight * (
+            _bounded_normalized_square(
+                features.roll_rate_deg_s,
+                config.roll_rate_scale_deg_s,
+                config.max_normalized_error_squared,
+            )
+        )
+        velocity_penalty = 0.0
+        action_smoothness_penalty = config.aileron_smoothness_weight * (
+            aileron_delta / 2.0
+        ) ** 2
+        survival_reward = config.survival_reward
+        target_inclination_error_deg = 0.0
+        inclination_tracking_error_deg = 0.0
+    elif config.profile == REWARD_PROFILE_ELEVATOR:
         features = (
             elevator_features
             if elevator_features is not None
@@ -402,6 +452,20 @@ def compute_elevator_hover_features(
         longitudinal_velocity_mps=longitudinal_velocity_mps,
         altitude_error_m=state.m_altitudeAGL_MTR - target_altitude_agl_m,
         vertical_velocity_mps=state.m_velocityWorldW_MPS,
+    )
+
+
+def compute_aileron_hover_features(
+    state: FlightAxisState,
+    *,
+    target_roll_deg: float,
+) -> AileronHoverFeatures:
+    return AileronHoverFeatures(
+        roll_error_deg=angular_error_deg(
+            state.m_roll_DEG,
+            target_roll_deg,
+        ),
+        roll_rate_deg_s=state.m_rollRate_DEGpSEC,
     )
 
 

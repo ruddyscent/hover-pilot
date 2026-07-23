@@ -12,13 +12,16 @@ from hoverpilot.rflink.client import RFLinkClient
 from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.rflink.protocol import state_looks_uninitialized
 from hoverpilot.training.hover import (
+    AileronHoverFeatures,
     ElevatorHoverFeatures,
+    REWARD_PROFILE_AILERON,
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_STANDARD,
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     STANDARD_HOVER_INCLINATION_DEG,
     RewardConfig,
     RewardBreakdown,
+    compute_aileron_hover_features,
     compute_elevator_hover_features,
     compute_elevator_recovery_target_deg,
     compute_reward,
@@ -38,15 +41,20 @@ DEFAULT_RESET_POLL_INTERVAL_SECONDS = 0.05
 class HoverTaskProfile(str, Enum):
     STANDARD = "full"
     ELEVATOR = "elevator"
+    AILERON = "aileron"
 
     @property
     def reward_profile(self) -> str:
+        if self is HoverTaskProfile.AILERON:
+            return REWARD_PROFILE_AILERON
         if self is HoverTaskProfile.ELEVATOR:
             return REWARD_PROFILE_ELEVATOR
         return REWARD_PROFILE_STANDARD
 
     @property
     def observation_dim(self) -> int:
+        if self is HoverTaskProfile.AILERON:
+            return 2
         if self is HoverTaskProfile.ELEVATOR:
             return 6
         return 13
@@ -57,7 +65,14 @@ class HoverTaskProfile(str, Enum):
 
     @property
     def require_vertical_start(self) -> bool:
-        return self is HoverTaskProfile.ELEVATOR
+        return self in {
+            HoverTaskProfile.AILERON,
+            HoverTaskProfile.ELEVATOR,
+        }
+
+    @property
+    def anchor_roll_to_reset_state(self) -> bool:
+        return self is HoverTaskProfile.AILERON
 
     @property
     def realflight_reference_inclination_deg(self) -> float:
@@ -68,6 +83,7 @@ class HoverTaskProfile(str, Enum):
 
 STANDARD_HOVER_TASK = HoverTaskProfile.STANDARD
 ELEVATOR_HOVER_TASK = HoverTaskProfile.ELEVATOR
+AILERON_HOVER_TASK = HoverTaskProfile.AILERON
 
 
 @dataclass
@@ -157,6 +173,21 @@ def elevator_features_to_observation(
             elevator_features.altitude_error_m / config.altitude_error_scale_m,
             elevator_features.vertical_velocity_mps
             / config.velocity_error_scale_mps,
+        ],
+        dtype=np.float32,
+    )
+    return np.clip(observation, -5.0, 5.0).astype(np.float32, copy=False)
+
+
+def aileron_features_to_observation(
+    aileron_features: AileronHoverFeatures,
+    *,
+    config: RewardConfig,
+) -> np.ndarray:
+    observation = np.asarray(
+        [
+            aileron_features.roll_error_deg / config.roll_error_scale_deg,
+            aileron_features.roll_rate_deg_s / config.roll_rate_scale_deg_s,
         ],
         dtype=np.float32,
     )
@@ -270,6 +301,7 @@ class HoverPilotHoverEnv(gym.Env):
         self._episode_started = False
         self._ground_contact_started_at_s = None  # type: Optional[float]
         self._previous_elevator = 0.0
+        self._previous_aileron = 0.0
         self._last_longitudinal_position_rate_mps = 0.0
 
         self.action_space = spaces.Box(
@@ -334,7 +366,21 @@ class HoverPilotHoverEnv(gym.Env):
         state: FlightAxisState,
         *,
         elevator_features: Optional[ElevatorHoverFeatures] = None,
+        aileron_features: Optional[AileronHoverFeatures] = None,
     ) -> np.ndarray:
+        if self.task_profile == AILERON_HOVER_TASK:
+            features = (
+                aileron_features
+                if aileron_features is not None
+                else compute_aileron_hover_features(
+                    state,
+                    target_roll_deg=self.reward_config.target_roll_deg,
+                )
+            )
+            return aileron_features_to_observation(
+                features,
+                config=self.reward_config,
+            )
         if self.task_profile == ELEVATOR_HOVER_TASK:
             features = (
                 elevator_features
@@ -361,6 +407,7 @@ class HoverPilotHoverEnv(gym.Env):
         self._episode_started = False
         self._ground_contact_started_at_s = None
         self._previous_elevator = 0.0
+        self._previous_aileron = 0.0
         self._last_longitudinal_position_rate_mps = 0.0
         self.close()
         self._client = self._client_factory()
@@ -372,6 +419,7 @@ class HoverPilotHoverEnv(gym.Env):
 
         state, episode_start_reason = self._wait_for_ready_state(ready_action)
         self._previous_elevator = ready_action.elevator
+        self._previous_aileron = ready_action.aileron
         return self._start_episode_from_state(state, episode_start_reason=episode_start_reason)
 
     def step(self, action: np.ndarray):
@@ -388,8 +436,18 @@ class HoverPilotHoverEnv(gym.Env):
             if self.task_profile == ELEVATOR_HOVER_TASK
             else None
         )
+        aileron_features = (
+            compute_aileron_hover_features(
+                state,
+                target_roll_deg=self.reward_config.target_roll_deg,
+            )
+            if self.task_profile == AILERON_HOVER_TASK
+            else None
+        )
         elevator_delta = rf_action.elevator - self._previous_elevator
+        aileron_delta = rf_action.aileron - self._previous_aileron
         self._previous_elevator = rf_action.elevator
+        self._previous_aileron = rf_action.aileron
         ground_contact_duration_s = self._update_ground_contact_duration(state)
         reward_breakdown = compute_reward(
             state,
@@ -398,6 +456,8 @@ class HoverPilotHoverEnv(gym.Env):
             ground_contact_duration_s=ground_contact_duration_s,
             elevator_delta=elevator_delta,
             elevator_features=elevator_features,
+            aileron_delta=aileron_delta,
+            aileron_features=aileron_features,
         )
         readiness = self.compute_episode_start_status(state)
         trainer_reset_reason = self._detect_trainer_reset(state)
@@ -456,6 +516,7 @@ class HoverPilotHoverEnv(gym.Env):
         observation = self._state_to_observation(
             state,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         info = self._build_info(
             state=state,
@@ -468,6 +529,7 @@ class HoverPilotHoverEnv(gym.Env):
             readiness=readiness,
             ground_contact_duration_s=ground_contact_duration_s,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         if elevator_features is not None:
             self._last_longitudinal_position_rate_mps = (
@@ -499,6 +561,7 @@ class HoverPilotHoverEnv(gym.Env):
             if assessment.can_start:
                 self._pending_episode_start = None
                 self._previous_elevator = 0.0
+                self._previous_aileron = 0.0
                 observation, info = self._start_episode_from_state(pending_state, episode_start_reason=reason)
                 return True, observation, info
 
@@ -517,6 +580,7 @@ class HoverPilotHoverEnv(gym.Env):
         if self._pending_episode_start is not None and assessment.can_start:
             self._pending_episode_start = None
             self._previous_elevator = wait_action.elevator
+            self._previous_aileron = wait_action.aileron
             observation, info = self._start_episode_from_state(state, episode_start_reason=pending_reason)
             return True, observation, info
         lifecycle = EpisodeLifecycleResult(
@@ -531,6 +595,14 @@ class HoverPilotHoverEnv(gym.Env):
             if self.task_profile == ELEVATOR_HOVER_TASK
             else None
         )
+        aileron_features = (
+            compute_aileron_hover_features(
+                state,
+                target_roll_deg=self.reward_config.target_roll_deg,
+            )
+            if self.task_profile == AILERON_HOVER_TASK
+            else None
+        )
         info = self._build_info(
             state=state,
             reward_breakdown=None,
@@ -542,6 +614,7 @@ class HoverPilotHoverEnv(gym.Env):
             readiness=assessment.readiness,
             ground_contact_duration_s=0.0,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         if elevator_features is not None:
             self._last_longitudinal_position_rate_mps = (
@@ -553,6 +626,7 @@ class HoverPilotHoverEnv(gym.Env):
             self._state_to_observation(
                 state,
                 elevator_features=elevator_features,
+                aileron_features=aileron_features,
             ),
             info,
         )
@@ -581,6 +655,14 @@ class HoverPilotHoverEnv(gym.Env):
             if self.task_profile == ELEVATOR_HOVER_TASK
             else None
         )
+        aileron_features = (
+            compute_aileron_hover_features(
+                state,
+                target_roll_deg=self.reward_config.target_roll_deg,
+            )
+            if self.task_profile == AILERON_HOVER_TASK
+            else None
+        )
         readiness = self.compute_episode_start_status(state)
         lifecycle = EpisodeLifecycleResult(
             ready=readiness.ready,
@@ -600,10 +682,12 @@ class HoverPilotHoverEnv(gym.Env):
             readiness=readiness,
             ground_contact_duration_s=0.0,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         observation = self._state_to_observation(
             state,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         return observation, info
 
@@ -701,11 +785,24 @@ class HoverPilotHoverEnv(gym.Env):
                 self.reward_config,
                 target_azimuth_deg=state.m_azimuth_DEG,
             )
+        if self.task_profile.anchor_roll_to_reset_state:
+            self.reward_config = replace(
+                self.reward_config,
+                target_roll_deg=state.m_roll_DEG,
+            )
         self._last_longitudinal_position_rate_mps = 0.0
         self._last_state = state
         elevator_features = (
             self._compute_elevator_features(state)
             if self.task_profile == ELEVATOR_HOVER_TASK
+            else None
+        )
+        aileron_features = (
+            compute_aileron_hover_features(
+                state,
+                target_roll_deg=self.reward_config.target_roll_deg,
+            )
+            if self.task_profile == AILERON_HOVER_TASK
             else None
         )
         readiness = self.compute_episode_start_status(state)
@@ -719,6 +816,7 @@ class HoverPilotHoverEnv(gym.Env):
         observation = self._state_to_observation(
             state,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         info = self._build_info(
             state=state,
@@ -731,6 +829,7 @@ class HoverPilotHoverEnv(gym.Env):
             readiness=readiness,
             ground_contact_duration_s=0.0,
             elevator_features=elevator_features,
+            aileron_features=aileron_features,
         )
         return observation, info
 
@@ -747,6 +846,7 @@ class HoverPilotHoverEnv(gym.Env):
         readiness: EpisodeLifecycleResult,
         ground_contact_duration_s: float,
         elevator_features: Optional[ElevatorHoverFeatures] = None,
+        aileron_features: Optional[AileronHoverFeatures] = None,
     ) -> Dict[str, Any]:
         debug_state = {
             "x_m": state.m_aircraftPositionX_MTR,
@@ -824,6 +924,16 @@ class HoverPilotHoverEnv(gym.Env):
                     ),
                 )
             )
+        if self.task_profile == AILERON_HOVER_TASK:
+            features = (
+                aileron_features
+                if aileron_features is not None
+                else compute_aileron_hover_features(
+                    state,
+                    target_roll_deg=self.reward_config.target_roll_deg,
+                )
+            )
+            info["aileron_hover_features"] = asdict(features)
         return info
 
     def _detect_trainer_reset(self, state: FlightAxisState) -> Optional[str]:
@@ -978,6 +1088,11 @@ class HoverPilotHoverEnv(gym.Env):
         )
 
     def _is_inactive_reset_state(self, state: FlightAxisState) -> bool:
+        if self.task_profile == AILERON_HOVER_TASK:
+            # The aileron-only Hover Trainer remains valid while stationary and
+            # does not emit a simulator reset. A deliberate RFLink reconnect is
+            # the episode boundary for this profile.
+            return False
         return (
             state.m_flightAxisControllerIsActive <= BOOL_FIELD_THRESHOLD
             and state.m_anEngineIsRunning <= BOOL_FIELD_THRESHOLD

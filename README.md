@@ -313,6 +313,31 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
+For an Airplane Hover Trainer configuration where only aileron is enabled,
+use the one-dimensional aileron mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode aileron \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_aileron.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-aileron \
+  --seed 42
+```
+
+Aileron mode observes only target-relative roll and roll rate. The roll target
+is anchored when each episode starts, angular differences wrap across
+`±180°`, and the reward penalizes squared normalized roll error, roll rate, and
+aileron changes. The actor is a minimal trim plus two positive gains:
+`trim - k_roll × roll_error - k_rate × roll_rate`. The trim cancels the
+trainer's persistent roll input, while the positive-gain parameterization keeps
+the learned correction pointed against the combined roll error.
+
+The aileron trainer does not emit a crash/reset boundary. At every episode time
+limit, HoverPilot closes RFLink, reconnects, anchors the next roll target, and
+starts the next episode from the live aircraft state. Stable stationary states
+are valid episode starts in this mode even when RealFlight reports both
+controller-active and engine-running as zero.
+
 For a RealFlight Hover Trainer configuration where PPO controls only elevator,
 use a one-dimensional policy and keep the other transmitted channels fixed:
 

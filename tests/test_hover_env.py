@@ -3,9 +3,11 @@ import unittest
 import numpy as np
 
 from hoverpilot.envs import (
+    AILERON_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
     HoverPilotHoverEnv,
     STANDARD_HOVER_TASK,
+    aileron_features_to_observation,
     elevator_features_to_observation,
     gym_action_to_rf_action,
     state_to_observation,
@@ -13,6 +15,7 @@ from hoverpilot.envs import (
 from hoverpilot.envs.hover_env import EpisodeLifecycleResult
 from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.training.hover import (
+    AileronHoverFeatures,
     RewardConfig,
     compute_elevator_hover_features,
 )
@@ -148,6 +151,55 @@ class HoverEnvTests(unittest.TestCase):
             ),
             atol=1.0e-6,
         )
+
+    def test_aileron_profile_anchors_roll_and_observes_wrapped_error_and_rate(self):
+        initial = self._state(
+            m_inclination_DEG=90.0,
+            m_roll_DEG=179.0,
+            m_flightAxisControllerIsActive=0.0,
+            m_anEngineIsRunning=0.0,
+        )
+        moved = self._state(
+            m_currentPhysicsTime_SEC=10.1,
+            m_inclination_DEG=90.0,
+            m_roll_DEG=-179.0,
+            m_rollRate_DEGpSEC=-30.0,
+        )
+        client = StubRFLinkClient([initial, moved])
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=AILERON_HOVER_TASK,
+            client_factory=lambda: client,
+            reset_poll_interval_seconds=0.0,
+        )
+
+        reset_observation, reset_info = env.reset()
+        observation, _, _, _, info = env.step(
+            np.asarray([0.25, 0.0, 0.55, 0.0], dtype=np.float32)
+        )
+
+        np.testing.assert_allclose(reset_observation, [0.0, 0.0])
+        np.testing.assert_allclose(observation, [2.0 / 30.0, -0.5])
+        self.assertEqual(reset_info["target_hover"]["roll_deg"], 179.0)
+        self.assertEqual(
+            info["aileron_hover_features"],
+            {
+                "roll_error_deg": 2.0,
+                "roll_rate_deg_s": -30.0,
+            },
+        )
+
+    def test_aileron_observation_uses_only_roll_control_state(self):
+        observation = aileron_features_to_observation(
+            AileronHoverFeatures(
+                roll_error_deg=15.0,
+                roll_rate_deg_s=-30.0,
+            ),
+            config=RewardConfig(),
+        )
+
+        np.testing.assert_allclose(observation, [0.5, -0.5])
 
     def test_elevator_profile_anchors_heading_and_zeroes_nose_up_error(self):
         client = StubRFLinkClient([

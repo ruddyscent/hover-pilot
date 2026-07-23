@@ -31,6 +31,7 @@ except ImportError as exc:
 else:
     from hoverpilot.rl.ppo import (
         ActorCritic,
+        CONTROL_MODE_AILERON,
         CONTROL_MODE_ELEVATOR,
         POLICY_PRESET_ELEVATOR_PD,
         POLICY_PRESET_NONE,
@@ -238,6 +239,73 @@ class PPOTrainingModuleTests(unittest.TestCase):
         mirrored_action = model.deterministic_action(mirrored)
 
         torch.testing.assert_close(mirrored_action, -action)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_policy_correction_is_antisymmetric_and_always_restoring(self):
+        model = ActorCritic(
+            2,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+        )
+        positive = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        negative = -positive
+
+        positive_mean = model._compute_policy_mean(positive)
+        negative_mean = model._compute_policy_mean(negative)
+        trim = model.aileron_policy_trim_latent
+        positive_correction = positive_mean - trim
+        negative_correction = negative_mean - trim
+
+        self.assertTrue(torch.all(positive_correction < 0.0))
+        self.assertTrue(torch.all(negative_correction > 0.0))
+        torch.testing.assert_close(
+            negative_correction,
+            -positive_correction,
+        )
+
+        with torch.no_grad():
+            model.aileron_policy_raw_gain.fill_(-5.0)
+        still_restoring = model._compute_policy_mean(positive) - trim
+        self.assertTrue(torch.all(still_restoring < 0.0))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_aileron_checkpoint_round_trip_preserves_roll_scales(self):
+        model = ActorCritic(
+            2,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+        )
+        reward_config = RewardConfig(
+            roll_error_scale_deg=22.0,
+            roll_rate_scale_deg_s=75.0,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/aileron.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_AILERON,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            loaded = load_policy_checkpoint(checkpoint_path)
+
+        self.assertEqual(loaded.control_mode, CONTROL_MODE_AILERON)
+        self.assertEqual(
+            loaded.observation_config,
+            {
+                "roll_error_scale_deg": 22.0,
+                "roll_rate_scale_deg_s": 75.0,
+            },
+        )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_compact_pure_ppo_actor_cannot_cancel_linear_recovery_with_critic_features(self):

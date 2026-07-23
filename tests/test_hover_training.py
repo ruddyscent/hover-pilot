@@ -2,10 +2,12 @@ import unittest
 
 from hoverpilot.rflink.models import FlightAxisState
 from hoverpilot.training.hover import (
+    REWARD_PROFILE_AILERON,
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
     RewardConfig,
     angular_error_deg,
+    compute_aileron_hover_features,
     compute_elevator_hover_features,
     compute_elevator_recovery_target_deg,
     compute_reward,
@@ -228,6 +230,48 @@ class HoverTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(rotating.angular_rate_penalty, 4.5)
         self.assertLess(tilted.reward, balanced.reward)
         self.assertLess(rotating.reward, balanced.reward)
+
+    def test_aileron_reward_penalizes_wrapped_roll_error_and_roll_rate(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_AILERON,
+            target_roll_deg=179.0,
+            boundary_proximity_weight=0.0,
+        )
+
+        balanced = compute_reward(
+            self._state(m_roll_DEG=179.0),
+            config,
+        )
+        wrapped = compute_reward(
+            self._state(m_roll_DEG=-176.0),
+            config,
+        )
+        rotating = compute_reward(
+            self._state(
+                m_roll_DEG=179.0,
+                m_rollRate_DEGpSEC=60.0,
+            ),
+            config,
+        )
+
+        self.assertEqual(balanced.attitude_penalty, 0.0)
+        self.assertEqual(balanced.angular_rate_penalty, 0.0)
+        self.assertAlmostEqual(wrapped.attitude_penalty, (5.0 / 30.0) ** 2)
+        self.assertAlmostEqual(rotating.angular_rate_penalty, 0.5)
+        self.assertLess(wrapped.reward, balanced.reward)
+        self.assertLess(rotating.reward, balanced.reward)
+
+    def test_aileron_features_use_target_relative_roll_and_measured_rate(self):
+        features = compute_aileron_hover_features(
+            self._state(
+                m_roll_DEG=-179.0,
+                m_rollRate_DEGpSEC=-42.0,
+            ),
+            target_roll_deg=179.0,
+        )
+
+        self.assertAlmostEqual(features.roll_error_deg, 2.0)
+        self.assertEqual(features.roll_rate_deg_s, -42.0)
 
     def test_elevator_recovery_target_is_symmetric_and_bounded(self):
         self.assertEqual(
