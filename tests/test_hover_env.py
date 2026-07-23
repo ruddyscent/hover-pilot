@@ -6,10 +6,12 @@ from hoverpilot.envs import (
     AILERON_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
     HoverPilotHoverEnv,
+    RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
     aileron_features_to_observation,
     elevator_features_to_observation,
     gym_action_to_rf_action,
+    rudder_features_to_observation,
     state_to_observation,
 )
 from hoverpilot.envs.hover_env import EpisodeLifecycleResult
@@ -17,6 +19,7 @@ from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.training.hover import (
     AileronHoverFeatures,
     RewardConfig,
+    RudderHoverFeatures,
     compute_elevator_hover_features,
 )
 
@@ -195,6 +198,57 @@ class HoverEnvTests(unittest.TestCase):
             AileronHoverFeatures(
                 roll_error_deg=15.0,
                 roll_rate_deg_s=-30.0,
+            ),
+            config=RewardConfig(),
+        )
+
+        np.testing.assert_allclose(observation, [0.5, -0.5])
+
+    def test_rudder_profile_integrates_yaw_rate_and_accepts_stationary_reconnect(self):
+        initial = self._state(
+            m_inclination_DEG=90.0,
+            m_azimuth_DEG=130.0,
+            m_flightAxisControllerIsActive=0.0,
+            m_anEngineIsRunning=0.0,
+        )
+        moved = self._state(
+            m_currentPhysicsTime_SEC=10.1,
+            m_inclination_DEG=89.0,
+            m_azimuth_DEG=130.0,
+            m_yawRate_DEGpSEC=-15.0,
+            m_flightAxisControllerIsActive=0.0,
+            m_anEngineIsRunning=0.0,
+        )
+        client = StubRFLinkClient([initial, moved])
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=RUDDER_HOVER_TASK,
+            client_factory=lambda: client,
+            reset_poll_interval_seconds=0.0,
+        )
+
+        reset_observation, reset_info = env.reset()
+        observation, _, _, _, info = env.step(
+            np.asarray([0.0, 0.0, 0.55, 0.25], dtype=np.float32)
+        )
+
+        np.testing.assert_allclose(reset_observation, [0.0, 0.0])
+        np.testing.assert_allclose(observation, [-0.1, -0.5])
+        self.assertEqual(reset_info["target_hover"]["azimuth_deg"], 0.0)
+        self.assertEqual(
+            info["rudder_hover_features"],
+            {
+                "rudder_angle_error_deg": -1.5,
+                "yaw_rate_deg_s": -15.0,
+            },
+        )
+
+    def test_rudder_observation_uses_only_integrated_angle_and_yaw_rate(self):
+        observation = rudder_features_to_observation(
+            RudderHoverFeatures(
+                rudder_angle_error_deg=7.5,
+                yaw_rate_deg_s=-15.0,
             ),
             config=RewardConfig(),
         )

@@ -32,7 +32,9 @@ else:
     from hoverpilot.rl.ppo import (
         ActorCritic,
         CONTROL_MODE_AILERON,
+        CONTROL_MODE_ALL,
         CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_RUDDER,
         POLICY_PRESET_ELEVATOR_PD,
         POLICY_PRESET_NONE,
         PPO_CHECKPOINT_FORMAT,
@@ -43,6 +45,7 @@ else:
         PPOTrainer,
         RolloutBuffer,
         build_policy_checkpoint,
+        _expand_policy_action,
         load_policy_checkpoint,
         parse_args,
         reset_env_with_wait,
@@ -152,7 +155,12 @@ class PPOTrainingModuleTests(unittest.TestCase):
     def test_squashed_policy_actions_respect_bounds_and_log_probs_match(self):
         low = np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32)
         high = np.ones(4, dtype=np.float32)
-        model = ActorCritic(13, low, high)
+        model = ActorCritic(
+            13,
+            low,
+            high,
+            control_mode=CONTROL_MODE_ALL,
+        )
         observation = torch.zeros((64, 13), dtype=torch.float32)
 
         action, old_log_prob, _ = model.get_action(observation)
@@ -169,6 +177,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             13,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
+            control_mode=CONTROL_MODE_ALL,
         )
         with torch.no_grad():
             model.policy_mean.weight.zero_()
@@ -186,7 +195,12 @@ class PPOTrainingModuleTests(unittest.TestCase):
     def test_deterministic_initial_policy_is_centered_near_hover_action(self):
         low = np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32)
         high = np.ones(4, dtype=np.float32)
-        model = ActorCritic(13, low, high)
+        model = ActorCritic(
+            13,
+            low,
+            high,
+            control_mode=CONTROL_MODE_ALL,
+        )
 
         action = model.deterministic_action(torch.zeros((1, 13), dtype=torch.float32))
 
@@ -203,6 +217,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_ELEVATOR_PD,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             model.policy_mean.weight.zero_()
@@ -225,6 +240,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         observation = torch.tensor(
             [[1.4, -0.3, 0.8, 0.6, 0.2, -0.1]],
@@ -247,6 +263,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_AILERON,
         )
         positive = torch.tensor(
             [[1.0, 0.0], [0.0, 1.0]],
@@ -279,6 +296,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_AILERON,
         )
         reward_config = RewardConfig(
             roll_error_scale_deg=22.0,
@@ -308,12 +326,93 @@ class PPOTrainingModuleTests(unittest.TestCase):
         )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_policy_is_antisymmetric_and_always_restoring(self):
+        model = ActorCritic(
+            2,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_RUDDER,
+        )
+        positive = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        negative = -positive
+
+        positive_action = model.deterministic_action(positive)
+        negative_action = model.deterministic_action(negative)
+
+        self.assertTrue(torch.all(positive_action > 0.0))
+        self.assertTrue(torch.all(negative_action < 0.0))
+        torch.testing.assert_close(negative_action, -positive_action)
+
+        with torch.no_grad():
+            model.rudder_policy_raw_gain.fill_(-5.0)
+        still_restoring = model.deterministic_action(positive)
+        self.assertTrue(torch.all(still_restoring > 0.0))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_action_expands_to_only_rudder_and_fixed_throttle(self):
+        policy_space = gym.spaces.Box(
+            low=np.asarray([-1.0], dtype=np.float32),
+            high=np.asarray([1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        action = _expand_policy_action(
+            np.asarray([0.25], dtype=np.float32),
+            policy_space,
+            CONTROL_MODE_RUDDER,
+            0.55,
+        )
+
+        np.testing.assert_allclose(action, [0.0, 0.0, 0.55, 0.25])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_checkpoint_round_trip_preserves_observation_scales(self):
+        model = ActorCritic(
+            2,
+            np.asarray([-1.0], dtype=np.float32),
+            np.asarray([1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_RUDDER,
+        )
+        reward_config = RewardConfig(
+            rudder_angle_error_scale_deg=12.0,
+            yaw_rate_scale_deg_s=45.0,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/rudder.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_RUDDER,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            loaded = load_policy_checkpoint(checkpoint_path)
+
+        self.assertEqual(loaded.control_mode, CONTROL_MODE_RUDDER)
+        self.assertEqual(
+            loaded.observation_config,
+            {
+                "rudder_angle_error_scale_deg": 12.0,
+                "yaw_rate_scale_deg_s": 45.0,
+            },
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_compact_pure_ppo_actor_cannot_cancel_linear_recovery_with_critic_features(self):
         model = ActorCritic(
             6,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         observation = torch.tensor(
             [[1.0, -0.5, 0.8, 0.3, 0.2, -0.1]],
@@ -344,6 +443,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             model.elevator_policy_raw_gain.fill_(-20.0)
@@ -365,6 +465,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             model.elevator_policy_raw_gain.copy_(
@@ -393,6 +494,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         observation = torch.tensor(
             [[1.0, 0.5, 0.2, -0.1, 0.0, 0.0]],
@@ -421,6 +523,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_ELEVATOR_PD,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             model.policy_mean.weight.zero_()
@@ -443,6 +546,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_ELEVATOR_PD,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             model.policy_mean.weight.zero_()
@@ -698,6 +802,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             6,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with TemporaryDirectory() as directory:
             unsupported_checkpoints = [
@@ -737,6 +842,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             6,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         base = build_policy_checkpoint(
             model,
@@ -789,6 +895,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
             policy_preset=POLICY_PRESET_ELEVATOR_PD,
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         with torch.no_grad():
             source_model.policy_mean.bias.fill_(-0.25)
@@ -837,6 +944,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             6,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
 
         class TestPlayer(PPOPlayer):
@@ -882,6 +990,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             6,
             np.asarray([-1.0], dtype=np.float32),
             np.asarray([1.0], dtype=np.float32),
+            control_mode=CONTROL_MODE_ELEVATOR,
         )
         reward_config = RewardConfig(
             inclination_error_scale_deg=11.0,

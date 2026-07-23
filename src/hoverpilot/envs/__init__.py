@@ -4,10 +4,12 @@ from hoverpilot.envs.hover_env import (
     EpisodeLifecycleResult,
     HoverTaskProfile,
     HoverPilotHoverEnv,
+    RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
     aileron_features_to_observation,
     elevator_features_to_observation,
     gym_action_to_rf_action,
+    rudder_features_to_observation,
     state_to_observation,
 )
 
@@ -17,9 +19,11 @@ __all__ = [
     "EpisodeLifecycleResult",
     "HoverTaskProfile",
     "HoverPilotHoverEnv",
+    "RUDDER_HOVER_TASK",
     "STANDARD_HOVER_TASK",
     "aileron_features_to_observation",
     "elevator_features_to_observation",
     "gym_action_to_rf_action",
+    "rudder_features_to_observation",
     "state_to_observation",
 ]

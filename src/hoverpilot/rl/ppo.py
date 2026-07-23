@@ -29,6 +29,7 @@ from hoverpilot.config import HOST, PORT
 from hoverpilot.envs import (
     AILERON_HOVER_TASK,
     ELEVATOR_HOVER_TASK,
+    RUDDER_HOVER_TASK,
     STANDARD_HOVER_TASK,
     HoverPilotHoverEnv,
     elevator_features_to_observation,
@@ -45,11 +46,17 @@ DEFAULT_INITIAL_ACTION = (0.0, 0.0, 0.55, 0.0)
 CONTROL_MODE_ALL = "all"
 CONTROL_MODE_ELEVATOR = "elevator"
 CONTROL_MODE_AILERON = "aileron"
+CONTROL_MODE_RUDDER = "rudder"
 CONTROL_MODES = (
     CONTROL_MODE_ALL,
     CONTROL_MODE_AILERON,
     CONTROL_MODE_ELEVATOR,
+    CONTROL_MODE_RUDDER,
 )
+CONNECTION_EPISODE_CONTROL_MODES = {
+    CONTROL_MODE_AILERON,
+    CONTROL_MODE_RUDDER,
+}
 POLICY_PRESET_NONE = "none"
 POLICY_PRESET_ELEVATOR_PD = "elevator-pd"
 POLICY_PRESETS = (POLICY_PRESET_NONE, POLICY_PRESET_ELEVATOR_PD)
@@ -68,6 +75,10 @@ _AILERON_PPO_INITIAL_GAIN = np.asarray(
     dtype=np.float32,
 )
 _AILERON_PPO_INITIAL_TRIM = 0.78
+_RUDDER_PPO_INITIAL_GAIN = np.asarray(
+    [1.50, 1.20],
+    dtype=np.float32,
+)
 _ELEVATOR_PD_PRIOR_LIMIT = 0.5
 _ELEVATOR_PD_RESIDUAL_LIMIT = 0.2
 _ELEVATOR_EFFECTIVE_RESTORING_ACTION = 0.2
@@ -84,6 +95,10 @@ _ELEVATOR_OBSERVATION_CONFIG_FIELDS = (
 _AILERON_OBSERVATION_CONFIG_FIELDS = (
     "roll_error_scale_deg",
     "roll_rate_scale_deg_s",
+)
+_RUDDER_OBSERVATION_CONFIG_FIELDS = (
+    "rudder_angle_error_scale_deg",
+    "yaw_rate_scale_deg_s",
 )
 DEFAULT_TIMESTEPS = 50_000
 DEFAULT_ELEVATOR_TIMESTEPS = 300_000
@@ -177,15 +192,24 @@ def _build_hover_env(
             AILERON_HOVER_TASK
             if control_mode == CONTROL_MODE_AILERON
             else (
-                ELEVATOR_HOVER_TASK
-                if control_mode == CONTROL_MODE_ELEVATOR
-                else STANDARD_HOVER_TASK
+                RUDDER_HOVER_TASK
+                if control_mode == CONTROL_MODE_RUDDER
+                else (
+                    ELEVATOR_HOVER_TASK
+                    if control_mode == CONTROL_MODE_ELEVATOR
+                    else STANDARD_HOVER_TASK
+                )
             )
         ),
         start_body_rate_threshold_deg_s=(
             180.0
-            if control_mode == CONTROL_MODE_AILERON
+            if control_mode in CONNECTION_EPISODE_CONTROL_MODES
             else 60.0
+        ),
+        elevator_start_inclination_tolerance_deg=(
+            5.0
+            if control_mode == CONTROL_MODE_RUDDER
+            else 0.5
         ),
         client_factory=lambda: RFLinkClient(
             config.host,
@@ -213,6 +237,7 @@ def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
     single_axis_mode = config.control_mode in {
         CONTROL_MODE_AILERON,
         CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_RUDDER,
     }
     return replace(
         config,
@@ -257,6 +282,7 @@ class ActorCritic(nn.Module):
         *,
         initial_policy_std: float = 0.25,
         policy_preset: str = POLICY_PRESET_NONE,
+        control_mode: str,
     ):
         super().__init__()
         if initial_policy_std <= 0.0:
@@ -289,12 +315,26 @@ class ActorCritic(nn.Module):
                 f"Policy preset {policy_preset!r} is not valid for "
                 f"{observation_dim} observations and {action_dim} actions"
             )
+        if control_mode not in CONTROL_MODES:
+            raise ValueError(
+                f"Unsupported control mode {control_mode!r}; "
+                f"choose one of {CONTROL_MODES}."
+            )
         self.policy_preset = policy_preset
         self.enforce_elevator_symmetry = (
-            observation_dim == 6 and action_dim == 1
+            control_mode == CONTROL_MODE_ELEVATOR
+            and observation_dim == 6
+            and action_dim == 1
         )
         self.enforce_aileron_symmetry = (
-            observation_dim == 2 and action_dim == 1
+            control_mode == CONTROL_MODE_AILERON
+            and observation_dim == 2
+            and action_dim == 1
+        )
+        self.enforce_rudder_symmetry = (
+            control_mode == CONTROL_MODE_RUDDER
+            and observation_dim == 2
+            and action_dim == 1
         )
         mirror_sign = (
             [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0]
@@ -328,6 +368,10 @@ class ActorCritic(nn.Module):
             self.enforce_aileron_symmetry
             and policy_preset == POLICY_PRESET_NONE
         )
+        use_linear_rudder_policy = (
+            self.enforce_rudder_symmetry
+            and policy_preset == POLICY_PRESET_NONE
+        )
         if use_linear_elevator_policy:
             initial_gain = torch.as_tensor(
                 _ELEVATOR_PPO_INITIAL_GAIN,
@@ -355,6 +399,16 @@ class ActorCritic(nn.Module):
         else:
             self.register_parameter("aileron_policy_raw_gain", None)
             self.register_parameter("aileron_policy_trim_latent", None)
+        if use_linear_rudder_policy:
+            initial_gain = torch.as_tensor(
+                _RUDDER_PPO_INITIAL_GAIN,
+                dtype=torch.float32,
+            )
+            self.rudder_policy_raw_gain = nn.Parameter(
+                torch.log(torch.expm1(initial_gain))
+            )
+        else:
+            self.register_parameter("rudder_policy_raw_gain", None)
         hidden_sizes = [128, 128]
         layers = []
         input_size = observation_dim
@@ -365,7 +419,11 @@ class ActorCritic(nn.Module):
         self.shared = nn.Sequential(*layers)
         self.policy_mean = (
             None
-            if use_linear_elevator_policy or use_linear_aileron_policy
+            if (
+                use_linear_elevator_policy
+                or use_linear_aileron_policy
+                or use_linear_rudder_policy
+            )
             else nn.Linear(hidden_sizes[-1], action_dim)
         )
         self.policy_log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
@@ -418,6 +476,12 @@ class ActorCritic(nn.Module):
             return None
         return torch.tanh(self.aileron_policy_trim_latent)
 
+    @property
+    def rudder_policy_gain(self) -> Optional[torch.Tensor]:
+        if self.rudder_policy_raw_gain is None:
+            return None
+        return F.softplus(self.rudder_policy_raw_gain)
+
     def _compute_policy_mean(
         self,
         obs: torch.Tensor,
@@ -437,6 +501,12 @@ class ActorCritic(nn.Module):
                 self.aileron_policy_trim_latent
                 - aileron_gain[0] * obs[..., 0:1]
                 - aileron_gain[1] * obs[..., 1:2]
+            )
+        rudder_gain = self.rudder_policy_gain
+        if rudder_gain is not None:
+            return (
+                rudder_gain[0] * obs[..., 0:1]
+                + rudder_gain[1] * obs[..., 1:2]
             )
 
         if hidden is None:
@@ -609,6 +679,7 @@ def _policy_action_space(
     if control_mode in {
         CONTROL_MODE_AILERON,
         CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_RUDDER,
     }:
         return gym.spaces.Box(
             low=np.asarray([-1.0], dtype=np.float32),
@@ -645,6 +716,11 @@ def _expand_policy_action(
             [0.0, action[0], elevator_fixed_throttle, 0.0],
             dtype=np.float32,
         )
+    if control_mode == CONTROL_MODE_RUDDER:
+        return np.asarray(
+            [0.0, 0.0, elevator_fixed_throttle, action[0]],
+            dtype=np.float32,
+        )
     return action
 
 
@@ -656,6 +732,7 @@ def _initial_env_action(
     if control_mode in {
         CONTROL_MODE_AILERON,
         CONTROL_MODE_ELEVATOR,
+        CONTROL_MODE_RUDDER,
     }:
         return np.asarray(
             [0.0, 0.0, elevator_fixed_throttle, 0.0],
@@ -722,15 +799,19 @@ def _validate_fixed_throttle(value: object, source: str) -> float:
     return float(value)
 
 
+def _observation_config_fields(control_mode: str) -> tuple[str, ...]:
+    if control_mode == CONTROL_MODE_AILERON:
+        return _AILERON_OBSERVATION_CONFIG_FIELDS
+    if control_mode == CONTROL_MODE_RUDDER:
+        return _RUDDER_OBSERVATION_CONFIG_FIELDS
+    return _ELEVATOR_OBSERVATION_CONFIG_FIELDS
+
+
 def _observation_config_from_reward_config(
     reward_config: RewardConfig,
     control_mode: str,
 ) -> Dict[str, float]:
-    fields = (
-        _AILERON_OBSERVATION_CONFIG_FIELDS
-        if control_mode == CONTROL_MODE_AILERON
-        else _ELEVATOR_OBSERVATION_CONFIG_FIELDS
-    )
+    fields = _observation_config_fields(control_mode)
     return {
         name: float(getattr(reward_config, name))
         for name in fields
@@ -743,11 +824,7 @@ def _validate_observation_config(
 ) -> Dict[str, float]:
     if not isinstance(value, Mapping):
         raise ValueError("PPO checkpoint observation_config must be a mapping")
-    fields = (
-        _AILERON_OBSERVATION_CONFIG_FIELDS
-        if control_mode == CONTROL_MODE_AILERON
-        else _ELEVATOR_OBSERVATION_CONFIG_FIELDS
-    )
+    fields = _observation_config_fields(control_mode)
     expected_fields = set(fields)
     if set(value) != expected_fields:
         raise ValueError(
@@ -921,6 +998,7 @@ class PPOTrainer:
                 if config.control_mode in {
                     CONTROL_MODE_AILERON,
                     CONTROL_MODE_ELEVATOR,
+                    CONTROL_MODE_RUDDER,
                 }
                 else 0.01
             )
@@ -933,6 +1011,7 @@ class PPOTrainer:
                 if config.control_mode in {
                     CONTROL_MODE_AILERON,
                     CONTROL_MODE_ELEVATOR,
+                    CONTROL_MODE_RUDDER,
                 }
                 else 0.25
             )
@@ -952,6 +1031,7 @@ class PPOTrainer:
             self.policy_action_space.high,
             initial_policy_std=self.policy_initial_std,
             policy_preset=self.policy_preset,
+            control_mode=config.control_mode,
         ).to(self.device)
         if resume_checkpoint is not None:
             self._load_resume_checkpoint(resume_checkpoint, config.resume_from)
@@ -995,6 +1075,8 @@ class PPOTrainer:
     def _policy_action_labels(self) -> tuple[str, ...]:
         if self.config.control_mode == CONTROL_MODE_AILERON:
             return ("aileron",)
+        if self.config.control_mode == CONTROL_MODE_RUDDER:
+            return ("rudder",)
         if self.config.control_mode == CONTROL_MODE_ELEVATOR:
             return ("elevator",)
         return ("aileron", "elevator", "throttle", "rudder")
@@ -1237,6 +1319,64 @@ class PPOTrainer:
             step,
         )
 
+    def _write_rudder_recovery_probe(self, step: int):
+        if (
+            self.config.control_mode != CONTROL_MODE_RUDDER
+            or self.env.observation_space.shape != (2,)
+        ):
+            return
+        probe = torch.tensor(
+            [
+                [1.0, 0.0],
+                [-1.0, 0.0],
+                [0.0, 1.0],
+                [0.0, -1.0],
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        with torch.no_grad():
+            corrections = (
+                self.model._compute_policy_mean(probe)[:, 0]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        restoring_margins = np.asarray(
+            [
+                corrections[0],
+                -corrections[1],
+                corrections[2],
+                -corrections[3],
+            ],
+            dtype=np.float32,
+        )
+        symmetry_error = float(
+            0.5
+            * (
+                abs(float(corrections[0] + corrections[1]))
+                + abs(float(corrections[2] + corrections[3]))
+            )
+        )
+        minimum_margin = float(restoring_margins.min())
+        print(
+            "[PPO] rudder recovery probe "
+            f"angle_correction={corrections[0]:+.3f}/{corrections[1]:+.3f} "
+            f"rate_correction={corrections[2]:+.3f}/{corrections[3]:+.3f} "
+            f"symmetry_error={symmetry_error:.3f} "
+            f"minimum_margin={minimum_margin:.3f}"
+        )
+        self._write_scalar(
+            "train/recovery_probe/symmetry_error",
+            symmetry_error,
+            step,
+        )
+        self._write_scalar(
+            "train/recovery_probe/minimum_restoring_margin",
+            minimum_margin,
+            step,
+        )
+
     def _elevator_probe_observation(
         self,
         features: ElevatorHoverFeatures,
@@ -1306,6 +1446,72 @@ class PPOTrainer:
         reward: float,
         info: Dict,
     ):
+        if self.config.control_mode == CONTROL_MODE_RUDDER:
+            features = info.get("rudder_hover_features", {})
+            if not features:
+                return
+            rudder_angle_error = float(
+                features.get("rudder_angle_error_deg", 0.0)
+            )
+            yaw_rate = float(features.get("yaw_rate_deg_s", 0.0))
+            rudder = float(env_action[3])
+            gains_tensor = self.model.rudder_policy_gain
+            gains = (
+                gains_tensor.detach().cpu().numpy()
+                if gains_tensor is not None
+                else np.ones(2, dtype=np.float32)
+            )
+            weighted_error = (
+                float(gains[0])
+                * rudder_angle_error
+                / self.env.reward_config.rudder_angle_error_scale_deg
+                + float(gains[1])
+                * yaw_rate
+                / self.env.reward_config.yaw_rate_scale_deg_s
+            )
+            restoring = (
+                abs(weighted_error) < 1.0e-3
+                or rudder * weighted_error > 0.0
+            )
+            print(
+                f"[PPO] control step={total_steps} reward={reward:+.3f} "
+                f"rudder={rudder:+.3f} "
+                f"angle_error={rudder_angle_error:+.2f}deg "
+                f"yaw_rate={yaw_rate:+.2f}deg/s "
+                f"restoring={restoring}"
+            )
+            self._write_scalar(
+                "train/control/rudder_action",
+                rudder,
+                total_steps,
+            )
+            self._write_scalar(
+                "train/control/restoring_action",
+                float(restoring),
+                total_steps,
+            )
+            self._write_scalar("train/control/reward", reward, total_steps)
+            self._write_scalar(
+                "train/state/rudder_angle_error_deg",
+                rudder_angle_error,
+                total_steps,
+            )
+            self._write_scalar(
+                "train/state/abs_rudder_angle_error_deg",
+                abs(rudder_angle_error),
+                total_steps,
+            )
+            self._write_scalar(
+                "train/state/yaw_rate_deg_s",
+                yaw_rate,
+                total_steps,
+            )
+            self._write_scalar(
+                "train/state/abs_yaw_rate_deg_s",
+                abs(yaw_rate),
+                total_steps,
+            )
+            return
         if self.config.control_mode == CONTROL_MODE_AILERON:
             features = info.get("aileron_hover_features", {})
             if not features:
@@ -1649,6 +1855,7 @@ class PPOTrainer:
                         self.config.control_mode in {
                             CONTROL_MODE_AILERON,
                             CONTROL_MODE_ELEVATOR,
+                            CONTROL_MODE_RUDDER,
                         }
                         and
                         self.config.telemetry_log_interval_steps > 0
@@ -1679,7 +1886,10 @@ class PPOTrainer:
                                 action=self._wait_action(),
                                 initial_action=self._initial_action(),
                             )
-                        elif self.config.control_mode == CONTROL_MODE_AILERON:
+                        elif (
+                            self.config.control_mode
+                            in CONNECTION_EPISODE_CONTROL_MODES
+                        ):
                             observation, info = reset_env_with_wait(
                                 self.env,
                                 action=self._wait_action(),
@@ -1808,6 +2018,7 @@ class PPOTrainer:
                 self._write_scalar("train/kl_early_stop", float(stopped_for_kl), total_steps)
                 self._write_aileron_recovery_probe(total_steps)
                 self._write_elevator_recovery_probe(total_steps)
+                self._write_rudder_recovery_probe(total_steps)
                 with torch.no_grad():
                     post_update_values = self.model(
                         rollout.observations[: rollout.index]
@@ -1929,6 +2140,21 @@ class PPOTrainer:
                                 )
                             )
                         )
+                    elif self.config.control_mode == CONTROL_MODE_RUDDER:
+                        rudder_features = info.get(
+                            "rudder_hover_features",
+                            {},
+                        )
+                        attitude_errors.append(
+                            abs(
+                                float(
+                                    rudder_features.get(
+                                        "rudder_angle_error_deg",
+                                        0.0,
+                                    )
+                                )
+                            )
+                        )
                     elif self.config.control_mode == CONTROL_MODE_ELEVATOR:
                         elevator_features = info.get(
                             "elevator_hover_features",
@@ -1965,7 +2191,8 @@ class PPOTrainer:
                     termination_counts[reason] += 1
                     if (
                         truncated
-                        and self.config.control_mode != CONTROL_MODE_AILERON
+                        and self.config.control_mode
+                        not in CONNECTION_EPISODE_CONTROL_MODES
                     ):
                         observation, _ = continue_env_after_truncation(self.env)
                     else:
@@ -2038,6 +2265,7 @@ class PPOPlayer:
             self.policy_action_space.low,
             self.policy_action_space.high,
             policy_preset=self.policy_preset,
+            control_mode=self.control_mode,
         ).to(self.device)
         try:
             self.model.load_state_dict(checkpoint.model_state_dict, strict=True)
@@ -2141,7 +2369,8 @@ class PPOPlayer:
                         )
                         if (
                             truncated
-                            and self.control_mode != CONTROL_MODE_AILERON
+                            and self.control_mode
+                            not in CONNECTION_EPISODE_CONTROL_MODES
                         ):
                             next_segment = continue_env_after_truncation(self.env)
                         break
@@ -2325,7 +2554,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=CONTROL_MODES,
         default=CONTROL_MODE_ALL,
         help=(
-            "Policy-controlled channels. aileron and elevator use "
+            "Policy-controlled channels. aileron, elevator, and rudder use "
             "one-dimensional single-axis policies."
         ),
     )

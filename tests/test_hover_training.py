@@ -5,12 +5,15 @@ from hoverpilot.training.hover import (
     REWARD_PROFILE_AILERON,
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
+    REWARD_PROFILE_RUDDER,
+    RudderHoverFeatures,
     RewardConfig,
     angular_error_deg,
     compute_aileron_hover_features,
     compute_elevator_hover_features,
     compute_elevator_recovery_target_deg,
     compute_reward,
+    compute_rudder_hover_features,
     compute_termination,
     project_onto_target_heading,
     signed_vertical_inclination_error_deg,
@@ -143,6 +146,8 @@ class HoverTrainingTests(unittest.TestCase):
             "longitudinal_position_scale_m": float("nan"),
             "altitude_error_scale_m": float("inf"),
             "velocity_error_scale_mps": 0.0,
+            "yaw_rate_scale_deg_s": 0.0,
+            "rudder_angle_error_scale_deg": 0.0,
         }
 
         for name, value in invalid_scales.items():
@@ -272,6 +277,46 @@ class HoverTrainingTests(unittest.TestCase):
 
         self.assertAlmostEqual(features.roll_error_deg, 2.0)
         self.assertEqual(features.roll_rate_deg_s, -42.0)
+
+    def test_rudder_reward_penalizes_integrated_angle_error_and_yaw_rate(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_RUDDER,
+            boundary_proximity_weight=0.0,
+        )
+
+        balanced = compute_reward(
+            self._state(),
+            config,
+            rudder_features=RudderHoverFeatures(0.0, 0.0),
+        )
+        tilted = compute_reward(
+            self._state(),
+            config,
+            rudder_features=RudderHoverFeatures(15.0, 0.0),
+        )
+        rotating = compute_reward(
+            self._state(m_yawRate_DEGpSEC=30.0),
+            config,
+            rudder_features=RudderHoverFeatures(0.0, 30.0),
+        )
+
+        self.assertEqual(balanced.attitude_penalty, 0.0)
+        self.assertEqual(balanced.angular_rate_penalty, 0.0)
+        self.assertAlmostEqual(tilted.attitude_penalty, 1.0)
+        self.assertAlmostEqual(rotating.angular_rate_penalty, 0.5)
+        self.assertLess(tilted.reward, balanced.reward)
+        self.assertLess(rotating.reward, balanced.reward)
+
+    def test_rudder_features_use_supplied_integrated_angle_and_yaw_rate(self):
+        features = compute_rudder_hover_features(
+            self._state(
+                m_yawRate_DEGpSEC=-12.0,
+            ),
+            rudder_angle_error_deg=7.5,
+        )
+
+        self.assertEqual(features.rudder_angle_error_deg, 7.5)
+        self.assertEqual(features.yaw_rate_deg_s, -12.0)
 
     def test_elevator_recovery_target_is_symmetric_and_bounded(self):
         self.assertEqual(

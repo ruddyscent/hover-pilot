@@ -8,6 +8,7 @@ from hoverpilot.rflink.models import FlightAxisState
 REWARD_PROFILE_STANDARD = "standard"
 REWARD_PROFILE_ELEVATOR = "elevator"
 REWARD_PROFILE_AILERON = "aileron"
+REWARD_PROFILE_RUDDER = "rudder"
 STANDARD_HOVER_INCLINATION_DEG = 0.0
 REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
 
@@ -38,8 +39,13 @@ class RewardConfig:
     aileron_roll_error_weight: float = 1.0
     aileron_roll_rate_weight: float = 0.5
     aileron_smoothness_weight: float = 0.01
+    rudder_angle_error_weight: float = 1.0
+    rudder_yaw_rate_weight: float = 0.5
+    rudder_smoothness_weight: float = 0.01
     roll_error_scale_deg: float = 30.0
     roll_rate_scale_deg_s: float = 60.0
+    yaw_rate_scale_deg_s: float = 30.0
+    rudder_angle_error_scale_deg: float = 15.0
     inclination_error_scale_deg: float = 15.0
     pitch_rate_scale_deg_s: float = 30.0
     longitudinal_position_scale_m: float = 4.0
@@ -75,6 +81,10 @@ class RewardConfig:
             "velocity_error_scale_mps": self.velocity_error_scale_mps,
             "roll_error_scale_deg": self.roll_error_scale_deg,
             "roll_rate_scale_deg_s": self.roll_rate_scale_deg_s,
+            "yaw_rate_scale_deg_s": self.yaw_rate_scale_deg_s,
+            "rudder_angle_error_scale_deg": (
+                self.rudder_angle_error_scale_deg
+            ),
         }
         for name, value in observation_scales.items():
             if not math.isfinite(value) or value <= 0.0:
@@ -113,6 +123,14 @@ class AileronHoverFeatures:
 
     roll_error_deg: float
     roll_rate_deg_s: float
+
+
+@dataclass(frozen=True)
+class RudderHoverFeatures:
+    """State features that rudder-only hover can directly influence."""
+
+    rudder_angle_error_deg: float
+    yaw_rate_deg_s: float
 
 
 @dataclass
@@ -200,6 +218,8 @@ def compute_reward(
     elevator_features: Optional[ElevatorHoverFeatures] = None,
     aileron_delta: float = 0.0,
     aileron_features: Optional[AileronHoverFeatures] = None,
+    rudder_delta: float = 0.0,
+    rudder_features: Optional[RudderHoverFeatures] = None,
 ) -> RewardBreakdown:
     termination = compute_termination(
         state,
@@ -208,7 +228,38 @@ def compute_reward(
         ground_contact_duration_s=ground_contact_duration_s,
     )
 
-    if config.profile == REWARD_PROFILE_AILERON:
+    if config.profile == REWARD_PROFILE_RUDDER:
+        features = (
+            rudder_features
+            if rudder_features is not None
+            else compute_rudder_hover_features(
+                state,
+            )
+        )
+        position_penalty = 0.0
+        altitude_penalty = 0.0
+        attitude_penalty = config.rudder_angle_error_weight * (
+            _bounded_normalized_square(
+                features.rudder_angle_error_deg,
+                config.rudder_angle_error_scale_deg,
+                config.max_normalized_error_squared,
+            )
+        )
+        angular_rate_penalty = config.rudder_yaw_rate_weight * (
+            _bounded_normalized_square(
+                features.yaw_rate_deg_s,
+                config.yaw_rate_scale_deg_s,
+                config.max_normalized_error_squared,
+            )
+        )
+        velocity_penalty = 0.0
+        action_smoothness_penalty = config.rudder_smoothness_weight * (
+            rudder_delta / 2.0
+        ) ** 2
+        survival_reward = config.survival_reward
+        target_inclination_error_deg = 0.0
+        inclination_tracking_error_deg = features.rudder_angle_error_deg
+    elif config.profile == REWARD_PROFILE_AILERON:
         features = (
             aileron_features
             if aileron_features is not None
@@ -466,6 +517,17 @@ def compute_aileron_hover_features(
             target_roll_deg,
         ),
         roll_rate_deg_s=state.m_rollRate_DEGpSEC,
+    )
+
+
+def compute_rudder_hover_features(
+    state: FlightAxisState,
+    *,
+    rudder_angle_error_deg: float = 0.0,
+) -> RudderHoverFeatures:
+    return RudderHoverFeatures(
+        rudder_angle_error_deg=rudder_angle_error_deg,
+        yaw_rate_deg_s=state.m_yawRate_DEGpSEC,
     )
 
 

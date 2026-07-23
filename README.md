@@ -338,6 +338,32 @@ starts the next episode from the live aircraft state. Stable stationary states
 are valid episode starts in this mode even when RealFlight reports both
 controller-active and engine-running as zero.
 
+For an Airplane Hover Trainer configuration where only rudder is enabled, use
+the one-dimensional rudder mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode rudder \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_rudder.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-rudder \
+  --seed 42
+```
+
+Rudder mode observes episode-relative rudder-axis angle and yaw rate. The angle
+is obtained by integrating RealFlight physics-time yaw rate and is reset to
+zero after each deliberate RFLink reconnect. This avoids assigning an
+unreliable sign from Euler inclination and azimuth at the vertical-attitude
+singularity. The reward penalizes only normalized rudder-axis angle, yaw rate,
+and rudder action changes. The PPO actor uses two learned positive gains:
+`k_angle × angle_error + k_rate × yaw_rate`. The measured RealFlight polarity
+is opposite the rudder command, so this constrained sign always produces a
+restoring correction.
+
+As in aileron mode, a 300-step time limit closes and reconnects RFLink to form
+the next episode because rudder-only hover does not produce a normal
+crash/reset boundary. A new rudder episode must begin within 5° of vertical;
+the reconnect state becomes the zero reference for the integrated angle.
+
 For a RealFlight Hover Trainer configuration where PPO controls only elevator,
 use a one-dimensional policy and keep the other transmitted channels fixed:
 
