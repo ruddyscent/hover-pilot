@@ -8,6 +8,7 @@ from hoverpilot.training.hover import (
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_RUDDER,
+    REWARD_PROFILE_RUDDER_THROTTLE,
     REWARD_PROFILE_THROTTLE,
     REWARD_PROFILE_ELEVATOR_THROTTLE,
     RudderHoverFeatures,
@@ -412,6 +413,35 @@ class HoverTrainingTests(unittest.TestCase):
             aileron_delta=0.4,
             throttle_delta=0.2,
             aileron_features=AileronHoverFeatures(15.0, 30.0),
+            throttle_features=ThrottleHoverFeatures(0.75, -2.5),
+        )
+
+        self.assertEqual(disturbed.position_penalty, 0.0)
+        self.assertGreater(disturbed.altitude_penalty, 0.0)
+        self.assertGreater(disturbed.attitude_penalty, 0.0)
+        self.assertGreater(disturbed.angular_rate_penalty, 0.0)
+        self.assertGreater(disturbed.velocity_penalty, 0.0)
+        self.assertGreater(disturbed.action_smoothness_penalty, 0.0)
+        self.assertEqual(disturbed.boundary_proximity_penalty, 0.0)
+        self.assertLess(disturbed.reward, balanced.reward)
+
+    def test_rudder_throttle_reward_penalizes_both_state_and_control_changes(self):
+        config = RewardConfig(
+            profile=REWARD_PROFILE_RUDDER_THROTTLE,
+            boundary_proximity_weight=2.0,
+        )
+        balanced = compute_reward(
+            self._state(),
+            config,
+            rudder_features=RudderHoverFeatures(0.0, 0.0),
+            throttle_features=ThrottleHoverFeatures(0.0, 0.0),
+        )
+        disturbed = compute_reward(
+            self._state(),
+            config,
+            rudder_delta=0.4,
+            throttle_delta=0.2,
+            rudder_features=RudderHoverFeatures(15.0, 30.0),
             throttle_features=ThrottleHoverFeatures(0.75, -2.5),
         )
 

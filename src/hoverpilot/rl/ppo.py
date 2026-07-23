@@ -32,6 +32,7 @@ from hoverpilot.envs import (
     ELEVATOR_HOVER_TASK,
     ELEVATOR_THROTTLE_HOVER_TASK,
     RUDDER_HOVER_TASK,
+    RUDDER_THROTTLE_HOVER_TASK,
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     HoverPilotHoverEnv,
@@ -54,6 +55,7 @@ CONTROL_MODE_RUDDER = "rudder"
 CONTROL_MODE_THROTTLE = "throttle"
 CONTROL_MODE_ELEVATOR_THROTTLE = "elevator-throttle"
 CONTROL_MODE_AILERON_THROTTLE = "aileron-throttle"
+CONTROL_MODE_RUDDER_THROTTLE = "rudder-throttle"
 CONTROL_MODES = (
     CONTROL_MODE_ALL,
     CONTROL_MODE_AILERON,
@@ -62,6 +64,7 @@ CONTROL_MODES = (
     CONTROL_MODE_THROTTLE,
     CONTROL_MODE_ELEVATOR_THROTTLE,
     CONTROL_MODE_AILERON_THROTTLE,
+    CONTROL_MODE_RUDDER_THROTTLE,
 )
 CONNECTION_EPISODE_CONTROL_MODES = {
     CONTROL_MODE_AILERON,
@@ -69,6 +72,7 @@ CONNECTION_EPISODE_CONTROL_MODES = {
     CONTROL_MODE_THROTTLE,
     CONTROL_MODE_ELEVATOR_THROTTLE,
     CONTROL_MODE_AILERON_THROTTLE,
+    CONTROL_MODE_RUDDER_THROTTLE,
 }
 POLICY_PRESET_NONE = "none"
 POLICY_PRESET_ELEVATOR_PD = "elevator-pd"
@@ -124,6 +128,10 @@ _THROTTLE_OBSERVATION_CONFIG_FIELDS = (
 )
 _AILERON_THROTTLE_OBSERVATION_CONFIG_FIELDS = (
     *_AILERON_OBSERVATION_CONFIG_FIELDS,
+    *_THROTTLE_OBSERVATION_CONFIG_FIELDS,
+)
+_RUDDER_THROTTLE_OBSERVATION_CONFIG_FIELDS = (
+    *_RUDDER_OBSERVATION_CONFIG_FIELDS,
     *_THROTTLE_OBSERVATION_CONFIG_FIELDS,
 )
 DEFAULT_TIMESTEPS = 50_000
@@ -227,6 +235,9 @@ def _build_hover_env(
                 CONTROL_MODE_AILERON_THROTTLE: (
                     AILERON_THROTTLE_HOVER_TASK
                 ),
+                CONTROL_MODE_RUDDER_THROTTLE: (
+                    RUDDER_THROTTLE_HOVER_TASK
+                ),
             }[control_mode]
         ),
         start_body_rate_threshold_deg_s=(
@@ -241,6 +252,7 @@ def _build_hover_env(
                 CONTROL_MODE_THROTTLE,
                 CONTROL_MODE_ELEVATOR_THROTTLE,
                 CONTROL_MODE_AILERON_THROTTLE,
+                CONTROL_MODE_RUDDER_THROTTLE,
             }
             else 0.5
         ),
@@ -277,6 +289,7 @@ def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
         CONTROL_MODE_THROTTLE,
         CONTROL_MODE_ELEVATOR_THROTTLE,
         CONTROL_MODE_AILERON_THROTTLE,
+        CONTROL_MODE_RUDDER_THROTTLE,
     }
     return replace(
         config,
@@ -385,9 +398,16 @@ class ActorCritic(nn.Module):
             )
         )
         self.enforce_rudder_symmetry = (
-            control_mode == CONTROL_MODE_RUDDER
-            and observation_dim == 2
-            and action_dim == 1
+            (
+                control_mode == CONTROL_MODE_RUDDER
+                and observation_dim == 2
+                and action_dim == 1
+            )
+            or (
+                control_mode == CONTROL_MODE_RUDDER_THROTTLE
+                and observation_dim == 4
+                and action_dim == 2
+            )
         )
         self.enforce_throttle_structure = (
             (
@@ -402,6 +422,11 @@ class ActorCritic(nn.Module):
             )
             or (
                 control_mode == CONTROL_MODE_AILERON_THROTTLE
+                and observation_dim == 4
+                and action_dim == 2
+            )
+            or (
+                control_mode == CONTROL_MODE_RUDDER_THROTTLE
                 and observation_dim == 4
                 and action_dim == 2
             )
@@ -598,6 +623,7 @@ class ActorCritic(nn.Module):
     ) -> torch.Tensor:
         elevator_gain = self.elevator_policy_gain
         aileron_gain = self.aileron_policy_gain
+        rudder_gain = self.rudder_policy_gain
         throttle_gain = self.throttle_policy_gain
         if elevator_gain is not None and throttle_gain is not None:
             assert self.throttle_policy_trim_latent is not None
@@ -625,6 +651,18 @@ class ActorCritic(nn.Module):
                 - throttle_gain[1] * obs[..., 3:4]
             )
             return torch.cat((aileron_mean, throttle_mean), dim=-1)
+        if rudder_gain is not None and throttle_gain is not None:
+            assert self.throttle_policy_trim_latent is not None
+            rudder_mean = (
+                rudder_gain[0] * obs[..., 0:1]
+                + rudder_gain[1] * obs[..., 1:2]
+            )
+            throttle_mean = (
+                self.throttle_policy_trim_latent
+                - throttle_gain[0] * obs[..., 2:3]
+                - throttle_gain[1] * obs[..., 3:4]
+            )
+            return torch.cat((rudder_mean, throttle_mean), dim=-1)
         if elevator_gain is not None:
             return (
                 -elevator_gain[0] * obs[..., 0:1]
@@ -637,7 +675,6 @@ class ActorCritic(nn.Module):
                 - aileron_gain[0] * obs[..., 0:1]
                 - aileron_gain[1] * obs[..., 1:2]
             )
-        rudder_gain = self.rudder_policy_gain
         if rudder_gain is not None:
             return (
                 rudder_gain[0] * obs[..., 0:1]
@@ -821,6 +858,7 @@ def _policy_action_space(
     if control_mode in {
         CONTROL_MODE_ELEVATOR_THROTTLE,
         CONTROL_MODE_AILERON_THROTTLE,
+        CONTROL_MODE_RUDDER_THROTTLE,
     }:
         return gym.spaces.Box(
             low=np.asarray([-1.0, 0.0], dtype=np.float32),
@@ -873,6 +911,11 @@ def _expand_policy_action(
             [action[0], 0.0, action[1], 0.0],
             dtype=np.float32,
         )
+    if control_mode == CONTROL_MODE_RUDDER_THROTTLE:
+        return np.asarray(
+            [0.0, 0.0, action[1], action[0]],
+            dtype=np.float32,
+        )
     if control_mode == CONTROL_MODE_AILERON:
         return np.asarray(
             [action[0], 0.0, elevator_fixed_throttle, 0.0],
@@ -904,6 +947,7 @@ def _initial_env_action(
     if control_mode in {
         CONTROL_MODE_THROTTLE,
         CONTROL_MODE_ELEVATOR_THROTTLE,
+        CONTROL_MODE_RUDDER_THROTTLE,
     }:
         return np.asarray(
             [0.0, 0.0, _THROTTLE_PPO_INITIAL_TRIM, 0.0],
@@ -990,6 +1034,8 @@ def _validate_fixed_throttle(value: object, source: str) -> float:
 
 
 def _observation_config_fields(control_mode: str) -> tuple[str, ...]:
+    if control_mode == CONTROL_MODE_RUDDER_THROTTLE:
+        return _RUDDER_THROTTLE_OBSERVATION_CONFIG_FIELDS
     if control_mode == CONTROL_MODE_AILERON_THROTTLE:
         return _AILERON_THROTTLE_OBSERVATION_CONFIG_FIELDS
     if control_mode == CONTROL_MODE_AILERON:
@@ -1196,6 +1242,7 @@ class PPOTrainer:
                     CONTROL_MODE_THROTTLE,
                     CONTROL_MODE_ELEVATOR_THROTTLE,
                     CONTROL_MODE_AILERON_THROTTLE,
+                    CONTROL_MODE_RUDDER_THROTTLE,
                 }
                 else 0.01
             )
@@ -1212,6 +1259,7 @@ class PPOTrainer:
                     CONTROL_MODE_THROTTLE,
                     CONTROL_MODE_ELEVATOR_THROTTLE,
                     CONTROL_MODE_AILERON_THROTTLE,
+                    CONTROL_MODE_RUDDER_THROTTLE,
                 }
                 else 0.25
             )
@@ -1267,6 +1315,7 @@ class PPOTrainer:
             CONTROL_MODE_THROTTLE,
             CONTROL_MODE_ELEVATOR_THROTTLE,
             CONTROL_MODE_AILERON_THROTTLE,
+            CONTROL_MODE_RUDDER_THROTTLE,
         }:
             return self._initial_action()
         return np.asarray(self.config.wait_action, dtype=np.float32)
@@ -1289,6 +1338,8 @@ class PPOTrainer:
             return ("elevator", "throttle")
         if self.config.control_mode == CONTROL_MODE_AILERON_THROTTLE:
             return ("aileron", "throttle")
+        if self.config.control_mode == CONTROL_MODE_RUDDER_THROTTLE:
+            return ("rudder", "throttle")
         if self.config.control_mode == CONTROL_MODE_ELEVATOR:
             return ("elevator",)
         return ("aileron", "elevator", "throttle", "rudder")
@@ -1543,18 +1594,25 @@ class PPOTrainer:
         )
 
     def _write_rudder_recovery_probe(self, step: int):
-        if (
-            self.config.control_mode != CONTROL_MODE_RUDDER
-            or self.env.observation_space.shape != (2,)
-        ):
+        if self.config.control_mode not in {
+            CONTROL_MODE_RUDDER,
+            CONTROL_MODE_RUDDER_THROTTLE,
+        }:
             return
+        expected_shape = (
+            (4,)
+            if self.config.control_mode == CONTROL_MODE_RUDDER_THROTTLE
+            else (2,)
+        )
+        if self.env.observation_space.shape != expected_shape:
+            return
+        probe_array = np.zeros((4, expected_shape[0]))
+        probe_array[0, 0] = 1.0
+        probe_array[1, 0] = -1.0
+        probe_array[2, 1] = 1.0
+        probe_array[3, 1] = -1.0
         probe = torch.tensor(
-            [
-                [1.0, 0.0],
-                [-1.0, 0.0],
-                [0.0, 1.0],
-                [0.0, -1.0],
-            ],
+            probe_array,
             dtype=torch.float32,
             device=self.device,
         )
@@ -1605,12 +1663,14 @@ class PPOTrainer:
             CONTROL_MODE_THROTTLE,
             CONTROL_MODE_ELEVATOR_THROTTLE,
             CONTROL_MODE_AILERON_THROTTLE,
+            CONTROL_MODE_RUDDER_THROTTLE,
         }:
             return
         throttle_probe_layout = {
             CONTROL_MODE_THROTTLE: ((2,), 0, 1, 0),
             CONTROL_MODE_ELEVATOR_THROTTLE: ((6,), 4, 5, 1),
             CONTROL_MODE_AILERON_THROTTLE: ((4,), 2, 3, 1),
+            CONTROL_MODE_RUDDER_THROTTLE: ((4,), 2, 3, 1),
         }
         (
             expected_shape,
@@ -1831,7 +1891,10 @@ class PPOTrainer:
                 total_steps,
             )
             return
-        if self.config.control_mode == CONTROL_MODE_RUDDER:
+        if self.config.control_mode in {
+            CONTROL_MODE_RUDDER,
+            CONTROL_MODE_RUDDER_THROTTLE,
+        }:
             features = info.get("rudder_hover_features", {})
             if not features:
                 return
@@ -1858,12 +1921,63 @@ class PPOTrainer:
                 abs(weighted_error) < 1.0e-3
                 or rudder * weighted_error > 0.0
             )
+            combined_mode = (
+                self.config.control_mode
+                == CONTROL_MODE_RUDDER_THROTTLE
+            )
+            throttle_description = ""
+            throttle_restoring = True
+            if combined_mode:
+                throttle_features = info.get(
+                    "throttle_hover_features",
+                    {},
+                )
+                altitude_error = float(
+                    throttle_features.get("altitude_error_m", 0.0)
+                )
+                vertical_velocity = float(
+                    throttle_features.get("vertical_velocity_mps", 0.0)
+                )
+                throttle = float(env_action[2])
+                throttle_gains = self.model.throttle_policy_gain
+                throttle_trim = self.model.throttle_policy_trim
+                assert throttle_gains is not None
+                assert throttle_trim is not None
+                throttle_gain_values = (
+                    throttle_gains.detach().cpu().numpy()
+                )
+                throttle_trim_value = float(
+                    throttle_trim.detach().cpu().item()
+                )
+                throttle_weighted_error = (
+                    float(throttle_gain_values[0])
+                    * altitude_error
+                    / self.env.reward_config.altitude_error_scale_m
+                    + float(throttle_gain_values[1])
+                    * vertical_velocity
+                    / self.env.reward_config.velocity_error_scale_mps
+                )
+                throttle_restoring = (
+                    abs(throttle_weighted_error) < 1.0e-3
+                    or (
+                        throttle - throttle_trim_value
+                    )
+                    * throttle_weighted_error
+                    < 0.0
+                )
+                throttle_description = (
+                    f" throttle={throttle:.3f}"
+                    f" alt_error={altitude_error:+.2f}m"
+                    f" vertical_velocity={vertical_velocity:+.2f}m/s"
+                    f" throttle_restoring={throttle_restoring}"
+                )
             print(
                 f"[PPO] control step={total_steps} reward={reward:+.3f} "
                 f"rudder={rudder:+.3f} "
                 f"angle_error={rudder_angle_error:+.2f}deg "
                 f"yaw_rate={yaw_rate:+.2f}deg/s "
-                f"restoring={restoring}"
+                f"rudder_restoring={restoring}"
+                f"{throttle_description}"
             )
             self._write_scalar(
                 "train/control/rudder_action",
@@ -1872,7 +1986,7 @@ class PPOTrainer:
             )
             self._write_scalar(
                 "train/control/restoring_action",
-                float(restoring),
+                float(restoring and throttle_restoring),
                 total_steps,
             )
             self._write_scalar("train/control/reward", reward, total_steps)
@@ -1896,6 +2010,22 @@ class PPOTrainer:
                 abs(yaw_rate),
                 total_steps,
             )
+            if combined_mode:
+                self._write_scalar(
+                    "train/control/throttle_action",
+                    throttle,
+                    total_steps,
+                )
+                self._write_scalar(
+                    "train/state/altitude_error_m",
+                    altitude_error,
+                    total_steps,
+                )
+                self._write_scalar(
+                    "train/state/vertical_velocity_mps",
+                    vertical_velocity,
+                    total_steps,
+                )
             return
         if self.config.control_mode in {
             CONTROL_MODE_AILERON,
@@ -2349,6 +2479,7 @@ class PPOTrainer:
                             CONTROL_MODE_THROTTLE,
                             CONTROL_MODE_ELEVATOR_THROTTLE,
                             CONTROL_MODE_AILERON_THROTTLE,
+                            CONTROL_MODE_RUDDER_THROTTLE,
                         }
                         and
                         self.config.telemetry_log_interval_steps > 0
@@ -2637,7 +2768,10 @@ class PPOTrainer:
                                 )
                             )
                         )
-                    elif self.config.control_mode == CONTROL_MODE_RUDDER:
+                    elif self.config.control_mode in {
+                        CONTROL_MODE_RUDDER,
+                        CONTROL_MODE_RUDDER_THROTTLE,
+                    }:
                         rudder_features = info.get(
                             "rudder_hover_features",
                             {},
@@ -2806,6 +2940,7 @@ class PPOPlayer:
             CONTROL_MODE_THROTTLE,
             CONTROL_MODE_ELEVATOR_THROTTLE,
             CONTROL_MODE_AILERON_THROTTLE,
+            CONTROL_MODE_RUDDER_THROTTLE,
         }:
             return self._initial_action()
         return np.asarray(self.config.wait_action, dtype=np.float32)
@@ -2821,6 +2956,7 @@ class PPOPlayer:
                 CONTROL_MODE_THROTTLE,
                 CONTROL_MODE_ELEVATOR_THROTTLE,
                 CONTROL_MODE_AILERON_THROTTLE,
+                CONTROL_MODE_RUDDER_THROTTLE,
             }
             else f"fixed_throttle={self.elevator_fixed_throttle:.3f}"
         )
@@ -3077,7 +3213,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=(
             "Policy-controlled channels. aileron, elevator, rudder, and "
             "throttle use one-dimensional policies; elevator-throttle "
-            "and aileron-throttle use two-dimensional policies."
+            "aileron-throttle, and rudder-throttle use two-dimensional "
+            "policies."
         ),
     )
     train_parser.add_argument(

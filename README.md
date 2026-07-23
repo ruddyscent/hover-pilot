@@ -415,6 +415,29 @@ each 300-step limit closes and reconnects RFLink. The initial roll and AGL
 targets survive deliberate reconnects so drift is not hidden; an actual
 trainer reposition establishes new targets.
 
+For an Airplane Hover Trainer configuration where only rudder and throttle
+are enabled, use the two-dimensional combined mode:
+
+```bash
+uv run hoverpilot-ppo train --control-mode rudder-throttle \
+  --max-episode-steps 300 \
+  --save-path ppo_hoverpilot_rudder_throttle.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-rudder-throttle \
+  --seed 42
+```
+
+This mode observes episode-relative rudder angle, yaw rate, target-relative
+AGL, and up-positive vertical velocity. Its independent structured outputs
+apply positive restoring gains to the measured rudder polarity and a learned
+hover trim plus restoring altitude gains to throttle. Aileron and elevator
+remain neutral. The reward contains only rudder-angle, yaw-rate, altitude,
+vertical-velocity, and enabled-action smoothness terms.
+
+Each 300-step limit deliberately closes and reconnects RFLink. The integrated
+rudder angle is reset to zero for the new episode, while the original AGL
+target survives the reconnect so height drift is not hidden. An actual trainer
+reposition establishes a new AGL target.
+
 For an Airplane Hover Trainer configuration where only elevator and throttle
 are enabled, use the two-dimensional combined mode:
 

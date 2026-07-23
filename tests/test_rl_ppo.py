@@ -37,6 +37,7 @@ else:
         CONTROL_MODE_ELEVATOR,
         CONTROL_MODE_ELEVATOR_THROTTLE,
         CONTROL_MODE_RUDDER,
+        CONTROL_MODE_RUDDER_THROTTLE,
         CONTROL_MODE_THROTTLE,
         POLICY_PRESET_ELEVATOR_PD,
         POLICY_PRESET_NONE,
@@ -607,6 +608,97 @@ class PPOTrainingModuleTests(unittest.TestCase):
             {
                 "roll_error_scale_deg": 22.0,
                 "roll_rate_scale_deg_s": 75.0,
+                "altitude_error_scale_m": 2.0,
+                "velocity_error_scale_mps": 4.0,
+            },
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_throttle_policy_has_independent_restoring_channels(self):
+        model = ActorCritic(
+            4,
+            np.asarray([-1.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_RUDDER_THROTTLE,
+        )
+        actions = model.deterministic_action(
+            torch.eye(4, dtype=torch.float32)
+        ).detach()
+        self.assertIsNotNone(model.throttle_policy_trim)
+        throttle_trim = model.throttle_policy_trim.detach()
+
+        self.assertEqual(tuple(actions.shape), (4, 2))
+        self.assertGreater(float(actions[0, 0]), 0.0)
+        self.assertGreater(float(actions[1, 0]), 0.0)
+        self.assertAlmostEqual(float(actions[2, 0]), 0.0)
+        self.assertAlmostEqual(float(actions[3, 0]), 0.0)
+        self.assertLess(float(actions[2, 1]), float(throttle_trim))
+        self.assertLess(float(actions[3, 1]), float(throttle_trim))
+        self.assertAlmostEqual(float(actions[0, 1]), float(throttle_trim))
+        self.assertAlmostEqual(float(actions[1, 1]), float(throttle_trim))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_throttle_action_expands_to_only_enabled_channels(self):
+        policy_space = gym.spaces.Box(
+            low=np.asarray([-1.0, 0.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        action = _expand_policy_action(
+            np.asarray([0.25, 0.7], dtype=np.float32),
+            policy_space,
+            CONTROL_MODE_RUDDER_THROTTLE,
+            0.2,
+        )
+
+        np.testing.assert_allclose(action, [0.0, 0.0, 0.7, 0.25])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_throttle_initial_action_uses_hover_throttle(self):
+        action = _initial_env_action(
+            CONTROL_MODE_RUDDER_THROTTLE,
+            0.2,
+            (0.0, 0.0, 0.55, 0.0),
+        )
+
+        np.testing.assert_allclose(action, [0.0, 0.0, 0.65, 0.0])
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_rudder_throttle_checkpoint_preserves_all_observation_scales(self):
+        model = ActorCritic(
+            4,
+            np.asarray([-1.0, 0.0], dtype=np.float32),
+            np.asarray([1.0, 1.0], dtype=np.float32),
+            policy_preset=POLICY_PRESET_NONE,
+            control_mode=CONTROL_MODE_RUDDER_THROTTLE,
+        )
+        reward_config = RewardConfig(
+            rudder_angle_error_scale_deg=12.0,
+            yaw_rate_scale_deg_s=45.0,
+            altitude_error_scale_m=2.0,
+            velocity_error_scale_mps=4.0,
+        )
+
+        with TemporaryDirectory() as directory:
+            checkpoint_path = f"{directory}/rudder-throttle.pt"
+            torch.save(
+                build_policy_checkpoint(
+                    model,
+                    control_mode=CONTROL_MODE_RUDDER_THROTTLE,
+                    elevator_fixed_throttle=0.55,
+                    reward_config=reward_config,
+                ),
+                checkpoint_path,
+            )
+            loaded = load_policy_checkpoint(checkpoint_path)
+
+        self.assertEqual(
+            loaded.observation_config,
+            {
+                "rudder_angle_error_scale_deg": 12.0,
+                "yaw_rate_scale_deg_s": 45.0,
                 "altitude_error_scale_m": 2.0,
                 "velocity_error_scale_mps": 4.0,
             },

@@ -7,6 +7,7 @@ from hoverpilot.envs.hover_env import (
     HoverTaskProfile,
     HoverPilotHoverEnv,
     RUDDER_HOVER_TASK,
+    RUDDER_THROTTLE_HOVER_TASK,
     STANDARD_HOVER_TASK,
     THROTTLE_HOVER_TASK,
     aileron_features_to_observation,
@@ -15,6 +16,7 @@ from hoverpilot.envs.hover_env import (
     elevator_throttle_features_to_observation,
     gym_action_to_rf_action,
     rudder_features_to_observation,
+    rudder_throttle_features_to_observation,
     state_to_observation,
     throttle_features_to_observation,
 )
@@ -28,6 +30,7 @@ __all__ = [
     "HoverTaskProfile",
     "HoverPilotHoverEnv",
     "RUDDER_HOVER_TASK",
+    "RUDDER_THROTTLE_HOVER_TASK",
     "STANDARD_HOVER_TASK",
     "THROTTLE_HOVER_TASK",
     "aileron_features_to_observation",
@@ -36,6 +39,7 @@ __all__ = [
     "elevator_throttle_features_to_observation",
     "gym_action_to_rf_action",
     "rudder_features_to_observation",
+    "rudder_throttle_features_to_observation",
     "state_to_observation",
     "throttle_features_to_observation",
 ]

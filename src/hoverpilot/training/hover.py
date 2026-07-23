@@ -12,6 +12,7 @@ REWARD_PROFILE_RUDDER = "rudder"
 REWARD_PROFILE_THROTTLE = "throttle"
 REWARD_PROFILE_ELEVATOR_THROTTLE = "elevator-throttle"
 REWARD_PROFILE_AILERON_THROTTLE = "aileron-throttle"
+REWARD_PROFILE_RUDDER_THROTTLE = "rudder-throttle"
 STANDARD_HOVER_INCLINATION_DEG = 0.0
 REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
 
@@ -276,8 +277,11 @@ def compute_reward(
         survival_reward = config.survival_reward
         target_inclination_error_deg = 0.0
         inclination_tracking_error_deg = 0.0
-    elif config.profile == REWARD_PROFILE_RUDDER:
-        features = (
+    elif config.profile in {
+        REWARD_PROFILE_RUDDER,
+        REWARD_PROFILE_RUDDER_THROTTLE,
+    }:
+        rudder_state = (
             rudder_features
             if rudder_features is not None
             else compute_rudder_hover_features(
@@ -285,28 +289,61 @@ def compute_reward(
             )
         )
         position_penalty = 0.0
-        altitude_penalty = 0.0
         attitude_penalty = config.rudder_angle_error_weight * (
             _bounded_normalized_square(
-                features.rudder_angle_error_deg,
+                rudder_state.rudder_angle_error_deg,
                 config.rudder_angle_error_scale_deg,
                 config.max_normalized_error_squared,
             )
         )
         angular_rate_penalty = config.rudder_yaw_rate_weight * (
             _bounded_normalized_square(
-                features.yaw_rate_deg_s,
+                rudder_state.yaw_rate_deg_s,
                 config.yaw_rate_scale_deg_s,
                 config.max_normalized_error_squared,
             )
         )
-        velocity_penalty = 0.0
         action_smoothness_penalty = config.rudder_smoothness_weight * (
             rudder_delta / 2.0
         ) ** 2
+        if config.profile == REWARD_PROFILE_RUDDER_THROTTLE:
+            throttle_state = (
+                throttle_features
+                if throttle_features is not None
+                else compute_throttle_hover_features(
+                    state,
+                    target_altitude_agl_m=(
+                        config.target_altitude_agl_m
+                    ),
+                )
+            )
+            altitude_penalty = (
+                config.throttle_altitude_error_weight
+                * _bounded_normalized_square(
+                    throttle_state.altitude_error_m,
+                    config.altitude_error_scale_m,
+                    config.max_normalized_error_squared,
+                )
+            )
+            velocity_penalty = (
+                config.throttle_vertical_velocity_weight
+                * _bounded_normalized_square(
+                    throttle_state.vertical_velocity_mps,
+                    config.velocity_error_scale_mps,
+                    config.max_normalized_error_squared,
+                )
+            )
+            action_smoothness_penalty += (
+                config.throttle_smoothness_weight * throttle_delta**2
+            )
+        else:
+            altitude_penalty = 0.0
+            velocity_penalty = 0.0
         survival_reward = config.survival_reward
         target_inclination_error_deg = 0.0
-        inclination_tracking_error_deg = features.rudder_angle_error_deg
+        inclination_tracking_error_deg = (
+            rudder_state.rudder_angle_error_deg
+        )
     elif config.profile in {
         REWARD_PROFILE_AILERON,
         REWARD_PROFILE_AILERON_THROTTLE,
@@ -487,6 +524,7 @@ def compute_reward(
         if config.profile in {
             REWARD_PROFILE_THROTTLE,
             REWARD_PROFILE_AILERON_THROTTLE,
+            REWARD_PROFILE_RUDDER_THROTTLE,
         }
         else _compute_boundary_proximity_penalty(state, config)
     )

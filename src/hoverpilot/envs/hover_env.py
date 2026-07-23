@@ -21,6 +21,7 @@ from hoverpilot.training.hover import (
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_ELEVATOR_THROTTLE,
     REWARD_PROFILE_RUDDER,
+    REWARD_PROFILE_RUDDER_THROTTLE,
     REWARD_PROFILE_STANDARD,
     REWARD_PROFILE_THROTTLE,
     REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
@@ -57,9 +58,12 @@ class HoverTaskProfile(str, Enum):
     THROTTLE = "throttle"
     ELEVATOR_THROTTLE = "elevator-throttle"
     AILERON_THROTTLE = "aileron-throttle"
+    RUDDER_THROTTLE = "rudder-throttle"
 
     @property
     def reward_profile(self) -> str:
+        if self is HoverTaskProfile.RUDDER_THROTTLE:
+            return REWARD_PROFILE_RUDDER_THROTTLE
         if self is HoverTaskProfile.AILERON_THROTTLE:
             return REWARD_PROFILE_AILERON_THROTTLE
         if self is HoverTaskProfile.ELEVATOR_THROTTLE:
@@ -76,6 +80,8 @@ class HoverTaskProfile(str, Enum):
 
     @property
     def observation_dim(self) -> int:
+        if self is HoverTaskProfile.RUDDER_THROTTLE:
+            return 4
         if self is HoverTaskProfile.AILERON_THROTTLE:
             return 4
         if self is HoverTaskProfile.ELEVATOR_THROTTLE:
@@ -106,6 +112,7 @@ class HoverTaskProfile(str, Enum):
             HoverTaskProfile.THROTTLE,
             HoverTaskProfile.ELEVATOR_THROTTLE,
             HoverTaskProfile.AILERON_THROTTLE,
+            HoverTaskProfile.RUDDER_THROTTLE,
         }
 
     @property
@@ -123,6 +130,7 @@ class HoverTaskProfile(str, Enum):
             HoverTaskProfile.THROTTLE,
             HoverTaskProfile.ELEVATOR_THROTTLE,
             HoverTaskProfile.AILERON_THROTTLE,
+            HoverTaskProfile.RUDDER_THROTTLE,
         }
 
     @property
@@ -140,10 +148,18 @@ class HoverTaskProfile(str, Enum):
         }
 
     @property
+    def uses_rudder_features(self) -> bool:
+        return self in {
+            HoverTaskProfile.RUDDER,
+            HoverTaskProfile.RUDDER_THROTTLE,
+        }
+
+    @property
     def uses_throttle_features(self) -> bool:
         return self in {
             HoverTaskProfile.THROTTLE,
             HoverTaskProfile.AILERON_THROTTLE,
+            HoverTaskProfile.RUDDER_THROTTLE,
         }
 
     @property
@@ -151,6 +167,7 @@ class HoverTaskProfile(str, Enum):
         return self in {
             HoverTaskProfile.ELEVATOR_THROTTLE,
             HoverTaskProfile.AILERON_THROTTLE,
+            HoverTaskProfile.RUDDER_THROTTLE,
         }
 
     @property
@@ -171,6 +188,7 @@ RUDDER_HOVER_TASK = HoverTaskProfile.RUDDER
 THROTTLE_HOVER_TASK = HoverTaskProfile.THROTTLE
 ELEVATOR_THROTTLE_HOVER_TASK = HoverTaskProfile.ELEVATOR_THROTTLE
 AILERON_THROTTLE_HOVER_TASK = HoverTaskProfile.AILERON_THROTTLE
+RUDDER_THROTTLE_HOVER_TASK = HoverTaskProfile.RUDDER_THROTTLE
 
 
 @dataclass
@@ -339,6 +357,26 @@ def aileron_throttle_features_to_observation(
         (
             aileron_features_to_observation(
                 aileron_features,
+                config=config,
+            ),
+            throttle_features_to_observation(
+                throttle_features,
+                config=config,
+            ),
+        )
+    ).astype(np.float32, copy=False)
+
+
+def rudder_throttle_features_to_observation(
+    rudder_features: RudderHoverFeatures,
+    throttle_features: ThrottleHoverFeatures,
+    *,
+    config: RewardConfig,
+) -> np.ndarray:
+    return np.concatenate(
+        (
+            rudder_features_to_observation(
+                rudder_features,
                 config=config,
             ),
             throttle_features_to_observation(
@@ -602,6 +640,22 @@ class HoverPilotHoverEnv(gym.Env):
                 height_features,
                 config=self.reward_config,
             )
+        if self.task_profile == RUDDER_THROTTLE_HOVER_TASK:
+            yaw_features = (
+                rudder_features
+                if rudder_features is not None
+                else self._compute_rudder_features(state)
+            )
+            height_features = (
+                throttle_features
+                if throttle_features is not None
+                else self._compute_throttle_features(state)
+            )
+            return rudder_throttle_features_to_observation(
+                yaw_features,
+                height_features,
+                config=self.reward_config,
+            )
         if self.task_profile == RUDDER_HOVER_TASK:
             features = (
                 rudder_features
@@ -696,7 +750,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         rudder_features = (
             self._compute_rudder_features(state)
-            if self.task_profile == RUDDER_HOVER_TASK
+            if self.task_profile.uses_rudder_features
             else None
         )
         throttle_features = (
@@ -881,7 +935,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         rudder_features = (
             self._compute_rudder_features(state)
-            if self.task_profile == RUDDER_HOVER_TASK
+            if self.task_profile.uses_rudder_features
             else None
         )
         throttle_features = (
@@ -955,7 +1009,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         rudder_features = (
             self._compute_rudder_features(state)
-            if self.task_profile == RUDDER_HOVER_TASK
+            if self.task_profile.uses_rudder_features
             else None
         )
         throttle_features = (
@@ -1073,6 +1127,7 @@ class HoverPilotHoverEnv(gym.Env):
             THROTTLE_HOVER_TASK,
             ELEVATOR_THROTTLE_HOVER_TASK,
             AILERON_THROTTLE_HOVER_TASK,
+            RUDDER_THROTTLE_HOVER_TASK,
         }:
             return RFControlAction(
                 aileron=(
@@ -1148,7 +1203,7 @@ class HoverPilotHoverEnv(gym.Env):
         )
         rudder_features = (
             self._compute_rudder_features(state)
-            if self.task_profile == RUDDER_HOVER_TASK
+            if self.task_profile.uses_rudder_features
             else None
         )
         throttle_features = (
@@ -1291,7 +1346,7 @@ class HoverPilotHoverEnv(gym.Env):
                 )
             )
             info["aileron_hover_features"] = asdict(features)
-        if self.task_profile == RUDDER_HOVER_TASK:
+        if self.task_profile.uses_rudder_features:
             features = (
                 rudder_features
                 if rudder_features is not None
