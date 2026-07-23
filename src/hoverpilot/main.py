@@ -15,7 +15,6 @@ WAITING_LOG_INTERVAL_S = 0.75
 def main():
     demo_reward_config = RewardConfig(
         min_altitude_agl_m=-1.0,
-        max_altitude_agl_m=50.0,
         controller_active_threshold=None,
     )
     env = HoverPilotHoverEnv(

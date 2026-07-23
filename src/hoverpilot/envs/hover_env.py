@@ -1,5 +1,7 @@
+import math
 import time
 from dataclasses import asdict, dataclass, replace
+from enum import Enum
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 import gymnasium as gym
@@ -9,7 +11,19 @@ from gymnasium import spaces
 from hoverpilot.rflink.client import RFLinkClient
 from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.rflink.protocol import state_looks_uninitialized
-from hoverpilot.training.hover import RewardConfig, TerminationResult, compute_reward, compute_termination
+from hoverpilot.training.hover import (
+    ElevatorHoverFeatures,
+    REWARD_PROFILE_ELEVATOR,
+    REWARD_PROFILE_STANDARD,
+    REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
+    STANDARD_HOVER_INCLINATION_DEG,
+    RewardConfig,
+    RewardBreakdown,
+    compute_elevator_hover_features,
+    compute_elevator_recovery_target_deg,
+    compute_reward,
+    project_onto_target_heading,
+)
 
 TRAINER_RESET_REASONS = {
     "trainer_reset",
@@ -19,6 +33,41 @@ TRAINER_RESET_REASONS = {
 BOOL_FIELD_THRESHOLD = 0.5
 DEFAULT_RESET_WAIT_SECONDS = 8.0
 DEFAULT_RESET_POLL_INTERVAL_SECONDS = 0.05
+
+
+class HoverTaskProfile(str, Enum):
+    STANDARD = "full"
+    ELEVATOR = "elevator"
+
+    @property
+    def reward_profile(self) -> str:
+        if self is HoverTaskProfile.ELEVATOR:
+            return REWARD_PROFILE_ELEVATOR
+        return REWARD_PROFILE_STANDARD
+
+    @property
+    def observation_dim(self) -> int:
+        if self is HoverTaskProfile.ELEVATOR:
+            return 6
+        return 13
+
+    @property
+    def anchor_heading_to_reset_state(self) -> bool:
+        return self is HoverTaskProfile.ELEVATOR
+
+    @property
+    def require_vertical_start(self) -> bool:
+        return self is HoverTaskProfile.ELEVATOR
+
+    @property
+    def realflight_reference_inclination_deg(self) -> float:
+        if self.require_vertical_start:
+            return REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG
+        return STANDARD_HOVER_INCLINATION_DEG
+
+
+STANDARD_HOVER_TASK = HoverTaskProfile.STANDARD
+ELEVATOR_HOVER_TASK = HoverTaskProfile.ELEVATOR
 
 
 @dataclass
@@ -38,7 +87,13 @@ class EpisodeBoundaryAssessment:
     pre_reset_wait: bool
 
 
-def state_to_observation(state: FlightAxisState) -> np.ndarray:
+def state_to_observation(
+    state: FlightAxisState,
+    *,
+    target_x_m: float = 0.0,
+    target_y_m: float = 0.0,
+    target_altitude_agl_m: float = 1.5,
+) -> np.ndarray:
     """Build a compact hover-oriented observation vector.
 
     These fields capture the variables most directly tied to stationary hover:
@@ -47,24 +102,65 @@ def state_to_observation(state: FlightAxisState) -> np.ndarray:
     compact and easier to tune.
     """
 
-    return np.asarray(
+    azimuth_rad = np.deg2rad(state.m_azimuth_DEG)
+    observation = np.asarray(
         [
-            state.m_aircraftPositionX_MTR,
-            state.m_aircraftPositionY_MTR,
-            state.m_altitudeAGL_MTR,
-            state.m_roll_DEG,
-            state.m_inclination_DEG,
-            state.m_azimuth_DEG,
-            state.m_velocityWorldU_MPS,
-            state.m_velocityWorldV_MPS,
-            state.m_velocityWorldW_MPS,
-            state.m_pitchRate_DEGpSEC,
-            state.m_rollRate_DEGpSEC,
-            state.m_yawRate_DEGpSEC,
+            (state.m_aircraftPositionX_MTR - target_x_m) / 8.0,
+            (state.m_aircraftPositionY_MTR - target_y_m) / 8.0,
+            (state.m_altitudeAGL_MTR - target_altitude_agl_m) / 3.0,
+            state.m_roll_DEG / 45.0,
+            state.m_inclination_DEG / 45.0,
+            np.sin(azimuth_rad),
+            np.cos(azimuth_rad),
+            state.m_velocityWorldU_MPS / 10.0,
+            state.m_velocityWorldV_MPS / 10.0,
+            state.m_velocityWorldW_MPS / 10.0,
+            state.m_pitchRate_DEGpSEC / 180.0,
+            state.m_rollRate_DEGpSEC / 180.0,
+            state.m_yawRate_DEGpSEC / 180.0,
         ],
         dtype=np.float32,
     )
+    return np.clip(observation, -5.0, 5.0).astype(np.float32, copy=False)
 
+
+def elevator_features_to_observation(
+    elevator_features: ElevatorHoverFeatures,
+    *,
+    config: RewardConfig,
+) -> np.ndarray:
+    """Normalize elevator hover features using the recovery-target frame."""
+
+    target_inclination_error_deg = compute_elevator_recovery_target_deg(
+        elevator_features.longitudinal_position_error_m,
+        elevator_features.longitudinal_velocity_mps,
+        position_gain_deg_per_m=(
+            config.elevator_recovery_position_gain_deg_per_m
+        ),
+        velocity_gain_deg_per_mps=(
+            config.elevator_recovery_velocity_gain_deg_per_mps
+        ),
+        inclination_limit_deg=config.elevator_recovery_inclination_limit_deg,
+    )
+    inclination_tracking_error_deg = (
+        elevator_features.inclination_error_deg
+        - target_inclination_error_deg
+    )
+    observation = np.asarray(
+        [
+            inclination_tracking_error_deg / config.inclination_error_scale_deg,
+            elevator_features.pitch_rate_deg_s / config.pitch_rate_scale_deg_s,
+            elevator_features.longitudinal_position_error_m
+            / config.longitudinal_position_scale_m,
+            elevator_features.longitudinal_velocity_mps
+            / config.velocity_error_scale_mps,
+            elevator_features.altitude_error_m / config.altitude_error_scale_m,
+            elevator_features.vertical_velocity_mps
+            / config.velocity_error_scale_mps,
+        ],
+        dtype=np.float32,
+    )
+    return np.clip(observation, -5.0, 5.0).astype(np.float32, copy=False)
 
 
 def gym_action_to_rf_action(action: Union[np.ndarray, list, tuple]) -> RFControlAction:
@@ -85,6 +181,22 @@ def gym_action_to_rf_action(action: Union[np.ndarray, list, tuple]) -> RFControl
     )
 
 
+def _mark_terminal_failure(
+    reward_breakdown: RewardBreakdown,
+    *,
+    reason: str,
+    terminal_failure_reward: float,
+) -> RewardBreakdown:
+    extra_penalty = 0.0 if reward_breakdown.terminated else terminal_failure_reward
+    return replace(
+        reward_breakdown,
+        reward=reward_breakdown.reward + extra_penalty,
+        terminal_penalty=reward_breakdown.terminal_penalty + extra_penalty,
+        terminated=True,
+        termination_reason=reason,
+    )
+
+
 class HoverPilotHoverEnv(gym.Env):
     metadata = {"render_modes": []}
 
@@ -96,6 +208,7 @@ class HoverPilotHoverEnv(gym.Env):
         max_episode_steps: Optional[int] = None,
         sleep_interval_s: float = 0.0,
         anchor_target_to_reset_state: bool = True,
+        task_profile: HoverTaskProfile = STANDARD_HOVER_TASK,
         reset_button_threshold: float = 0.5,
         lost_components_threshold: float = 0.5,
         physics_time_reset_tolerance_s: float = 1.0e-3,
@@ -110,6 +223,7 @@ class HoverPilotHoverEnv(gym.Env):
         start_groundspeed_threshold_mps: float = 1.0,
         start_airspeed_threshold_mps: float = 1.5,
         start_body_rate_threshold_deg_s: float = 60.0,
+        elevator_start_inclination_tolerance_deg: float = 0.5,
         reposition_speed_threshold_mps: float = 0.5,
         reset_teleport_distance_m: float = 2.0,
         client_factory: Optional[Callable[[], RFLinkClient]] = None,
@@ -117,10 +231,15 @@ class HoverPilotHoverEnv(gym.Env):
         super().__init__()
         self.host = host
         self.port = port
-        self.reward_config = RewardConfig() if reward_config is None else reward_config
         self.max_episode_steps = max_episode_steps
         self.sleep_interval_s = sleep_interval_s
         self.anchor_target_to_reset_state = anchor_target_to_reset_state
+        self.task_profile = task_profile
+        base_reward_config = RewardConfig() if reward_config is None else reward_config
+        self.reward_config = replace(
+            base_reward_config,
+            profile=task_profile.reward_profile,
+        )
         self.reset_button_threshold = reset_button_threshold
         self.lost_components_threshold = lost_components_threshold
         self.physics_time_reset_tolerance_s = physics_time_reset_tolerance_s
@@ -135,6 +254,9 @@ class HoverPilotHoverEnv(gym.Env):
         self.start_groundspeed_threshold_mps = start_groundspeed_threshold_mps
         self.start_airspeed_threshold_mps = start_airspeed_threshold_mps
         self.start_body_rate_threshold_deg_s = start_body_rate_threshold_deg_s
+        self.elevator_start_inclination_tolerance_deg = (
+            elevator_start_inclination_tolerance_deg
+        )
         self.reposition_speed_threshold_mps = reposition_speed_threshold_mps
         self.reset_teleport_distance_m = reset_teleport_distance_m
         self._client_factory = (
@@ -147,6 +269,8 @@ class HoverPilotHoverEnv(gym.Env):
         self._waiting_for_reset = False
         self._episode_started = False
         self._ground_contact_started_at_s = None  # type: Optional[float]
+        self._previous_elevator = 0.0
+        self._last_longitudinal_position_rate_mps = 0.0
 
         self.action_space = spaces.Box(
             low=np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32),
@@ -154,41 +278,78 @@ class HoverPilotHoverEnv(gym.Env):
             dtype=np.float32,
         )
         self.observation_space = spaces.Box(
-            low=np.asarray(
-                [
-                    -500.0,
-                    -500.0,
-                    -10.0,
-                    -180.0,
-                    -180.0,
-                    -360.0,
-                    -200.0,
-                    -200.0,
-                    -200.0,
-                    -720.0,
-                    -720.0,
-                    -720.0,
-                ],
-                dtype=np.float32,
-            ),
-            high=np.asarray(
-                [
-                    500.0,
-                    500.0,
-                    200.0,
-                    180.0,
-                    180.0,
-                    360.0,
-                    200.0,
-                    200.0,
-                    200.0,
-                    720.0,
-                    720.0,
-                    720.0,
-                ],
-                dtype=np.float32,
-            ),
+            low=-5.0,
+            high=5.0,
+            shape=(task_profile.observation_dim,),
             dtype=np.float32,
+        )
+
+    def _compute_elevator_features(
+        self,
+        state: FlightAxisState,
+    ) -> ElevatorHoverFeatures:
+        position_rate_mps = self._last_longitudinal_position_rate_mps
+        previous_state = self._last_state
+        if previous_state is None:
+            position_rate_mps = 0.0
+        else:
+            delta_time_s = (
+                state.m_currentPhysicsTime_SEC
+                - previous_state.m_currentPhysicsTime_SEC
+            )
+            delta_x_m = (
+                state.m_aircraftPositionX_MTR
+                - previous_state.m_aircraftPositionX_MTR
+            )
+            delta_y_m = (
+                state.m_aircraftPositionY_MTR
+                - previous_state.m_aircraftPositionY_MTR
+            )
+            displacement_m = math.hypot(delta_x_m, delta_y_m)
+            if (
+                delta_time_s > self.physics_time_reset_tolerance_s
+                and displacement_m < self.reset_teleport_distance_m
+            ):
+                position_rate_mps = project_onto_target_heading(
+                    delta_x_m / delta_time_s,
+                    delta_y_m / delta_time_s,
+                    self.reward_config.target_azimuth_deg,
+                )
+            elif (
+                delta_time_s < -self.physics_time_reset_tolerance_s
+                or displacement_m >= self.reset_teleport_distance_m
+            ):
+                position_rate_mps = 0.0
+        return compute_elevator_hover_features(
+            state,
+            target_x_m=self.reward_config.target_x_m,
+            target_y_m=self.reward_config.target_y_m,
+            target_altitude_agl_m=self.reward_config.target_altitude_agl_m,
+            target_azimuth_deg=self.reward_config.target_azimuth_deg,
+            longitudinal_position_rate_mps=position_rate_mps,
+        )
+
+    def _state_to_observation(
+        self,
+        state: FlightAxisState,
+        *,
+        elevator_features: Optional[ElevatorHoverFeatures] = None,
+    ) -> np.ndarray:
+        if self.task_profile == ELEVATOR_HOVER_TASK:
+            features = (
+                elevator_features
+                if elevator_features is not None
+                else self._compute_elevator_features(state)
+            )
+            return elevator_features_to_observation(
+                features,
+                config=self.reward_config,
+            )
+        return state_to_observation(
+            state,
+            target_x_m=self.reward_config.target_x_m,
+            target_y_m=self.reward_config.target_y_m,
+            target_altitude_agl_m=self.reward_config.target_altitude_agl_m,
         )
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -199,6 +360,8 @@ class HoverPilotHoverEnv(gym.Env):
         self._waiting_for_reset = False
         self._episode_started = False
         self._ground_contact_started_at_s = None
+        self._previous_elevator = 0.0
+        self._last_longitudinal_position_rate_mps = 0.0
         self.close()
         self._client = self._client_factory()
         self._client.connect()
@@ -208,6 +371,7 @@ class HoverPilotHoverEnv(gym.Env):
             ready_action = gym_action_to_rf_action(options["initial_action"])
 
         state, episode_start_reason = self._wait_for_ready_state(ready_action)
+        self._previous_elevator = ready_action.elevator
         return self._start_episode_from_state(state, episode_start_reason=episode_start_reason)
 
     def step(self, action: np.ndarray):
@@ -219,18 +383,21 @@ class HoverPilotHoverEnv(gym.Env):
 
         rf_action = gym_action_to_rf_action(action)
         state = self._client.step(rf_action)
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile == ELEVATOR_HOVER_TASK
+            else None
+        )
+        elevator_delta = rf_action.elevator - self._previous_elevator
+        self._previous_elevator = rf_action.elevator
         ground_contact_duration_s = self._update_ground_contact_duration(state)
         reward_breakdown = compute_reward(
             state,
             self.reward_config,
             episode_started=self._episode_started,
             ground_contact_duration_s=ground_contact_duration_s,
-        )
-        termination = compute_termination(
-            state,
-            self.reward_config,
-            episode_started=self._episode_started,
-            ground_contact_duration_s=ground_contact_duration_s,
+            elevator_delta=elevator_delta,
+            elevator_features=elevator_features,
         )
         readiness = self.compute_episode_start_status(state)
         trainer_reset_reason = self._detect_trainer_reset(state)
@@ -238,9 +405,9 @@ class HoverPilotHoverEnv(gym.Env):
         lifecycle = EpisodeLifecycleResult(
             ready=readiness.ready,
             started=self._episode_started,
-            terminated=termination.terminated,
+            terminated=reward_breakdown.terminated,
             truncated=False,
-            reason=termination.termination_reason,
+            reason=reward_breakdown.termination_reason,
         )
 
         if trainer_reset_reason is not None:
@@ -253,43 +420,43 @@ class HoverPilotHoverEnv(gym.Env):
                 pending_reset_reason=trainer_reset_reason,
             ).can_start:
                 self._waiting_for_reset = False
-            reward_breakdown = replace(
+            reward_breakdown = _mark_terminal_failure(
                 reward_breakdown,
-                reward=reward_breakdown.reward + self.reward_config.terminal_failure_reward,
-                terminal_penalty=reward_breakdown.terminal_penalty + self.reward_config.terminal_failure_reward,
-                terminated=True,
-                termination_reason=trainer_reset_reason,
+                reason=trainer_reset_reason,
+                terminal_failure_reward=self.reward_config.terminal_failure_reward,
             )
-            termination = TerminationResult(True, trainer_reset_reason)
             lifecycle = replace(lifecycle, terminated=True, started=False, reason=trainer_reset_reason)
 
         if (
             parked_reason is not None
             and trainer_reset_reason is None
-            and (not termination.terminated or termination.termination_reason == "altitude_too_low")
+            and (
+                not reward_breakdown.terminated
+                or reward_breakdown.termination_reason == "altitude_too_low"
+            )
         ):
             self._waiting_for_reset = True
             self._episode_started = False
-            reward_breakdown = replace(
+            reward_breakdown = _mark_terminal_failure(
                 reward_breakdown,
-                reward=reward_breakdown.reward + self.reward_config.terminal_failure_reward,
-                terminal_penalty=reward_breakdown.terminal_penalty + self.reward_config.terminal_failure_reward,
-                terminated=True,
-                termination_reason=parked_reason,
+                reason=parked_reason,
+                terminal_failure_reward=self.reward_config.terminal_failure_reward,
             )
-            termination = TerminationResult(True, parked_reason)
             lifecycle = replace(lifecycle, terminated=True, started=False, reason=parked_reason)
 
         self._episode_steps += 1
         truncated = self.max_episode_steps is not None and self._episode_steps >= self.max_episode_steps
         lifecycle = replace(lifecycle, truncated=truncated)
 
-        if termination.terminated and trainer_reset_reason is None:
+        if reward_breakdown.terminated and trainer_reset_reason is None:
             self._waiting_for_reset = True
             self._episode_started = False
             lifecycle = replace(lifecycle, started=False)
 
-        observation = state_to_observation(state)
+        observation = self._state_to_observation(
+            state,
+            elevator_features=elevator_features,
+        )
         info = self._build_info(
             state=state,
             reward_breakdown=reward_breakdown,
@@ -300,12 +467,17 @@ class HoverPilotHoverEnv(gym.Env):
             lifecycle=lifecycle,
             readiness=readiness,
             ground_contact_duration_s=ground_contact_duration_s,
+            elevator_features=elevator_features,
         )
+        if elevator_features is not None:
+            self._last_longitudinal_position_rate_mps = (
+                elevator_features.longitudinal_velocity_mps
+            )
         self._last_state = state
         return (
             observation,
             float(reward_breakdown.reward),
-            bool(termination.terminated),
+            bool(reward_breakdown.terminated),
             bool(truncated),
             info,
         )
@@ -326,6 +498,7 @@ class HoverPilotHoverEnv(gym.Env):
             )
             if assessment.can_start:
                 self._pending_episode_start = None
+                self._previous_elevator = 0.0
                 observation, info = self._start_episode_from_state(pending_state, episode_start_reason=reason)
                 return True, observation, info
 
@@ -343,6 +516,7 @@ class HoverPilotHoverEnv(gym.Env):
 
         if self._pending_episode_start is not None and assessment.can_start:
             self._pending_episode_start = None
+            self._previous_elevator = wait_action.elevator
             observation, info = self._start_episode_from_state(state, episode_start_reason=pending_reason)
             return True, observation, info
         lifecycle = EpisodeLifecycleResult(
@@ -351,6 +525,11 @@ class HoverPilotHoverEnv(gym.Env):
             terminated=False,
             truncated=False,
             reason=assessment.readiness.reason,
+        )
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile == ELEVATOR_HOVER_TASK
+            else None
         )
         info = self._build_info(
             state=state,
@@ -362,9 +541,21 @@ class HoverPilotHoverEnv(gym.Env):
             lifecycle=lifecycle,
             readiness=assessment.readiness,
             ground_contact_duration_s=0.0,
+            elevator_features=elevator_features,
         )
+        if elevator_features is not None:
+            self._last_longitudinal_position_rate_mps = (
+                elevator_features.longitudinal_velocity_mps
+            )
         self._last_state = state
-        return False, state_to_observation(state), info
+        return (
+            False,
+            self._state_to_observation(
+                state,
+                elevator_features=elevator_features,
+            ),
+            info,
+        )
 
     def wait_for_next_episode(
         self,
@@ -374,6 +565,47 @@ class HoverPilotHoverEnv(gym.Env):
             started, observation, info = self.poll_wait_for_next_episode(action=action)
             if started:
                 return observation, info
+
+    def continue_after_truncation(self):
+        """Start a new time-limit segment without resetting the live aircraft."""
+
+        if self._last_state is None or not self._episode_started:
+            raise RuntimeError("cannot continue a truncated episode without an active aircraft state")
+        if self._waiting_for_reset:
+            raise RuntimeError("cannot continue a truncated episode while waiting for trainer reset")
+
+        self._episode_steps = 0
+        state = self._last_state
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile == ELEVATOR_HOVER_TASK
+            else None
+        )
+        readiness = self.compute_episode_start_status(state)
+        lifecycle = EpisodeLifecycleResult(
+            ready=readiness.ready,
+            started=True,
+            terminated=False,
+            truncated=False,
+            reason="time_limit_continuation",
+        )
+        info = self._build_info(
+            state=state,
+            reward_breakdown=None,
+            truncated=False,
+            reset=False,
+            episode_start_reason="time_limit_continuation",
+            waiting_for_reset=False,
+            lifecycle=lifecycle,
+            readiness=readiness,
+            ground_contact_duration_s=0.0,
+            elevator_features=elevator_features,
+        )
+        observation = self._state_to_observation(
+            state,
+            elevator_features=elevator_features,
+        )
+        return observation, info
 
     def render(self):
         return None
@@ -464,7 +696,18 @@ class HoverPilotHoverEnv(gym.Env):
                 target_y_m=state.m_aircraftPositionY_MTR,
                 target_altitude_agl_m=state.m_altitudeAGL_MTR,
             )
+        if self.task_profile.anchor_heading_to_reset_state:
+            self.reward_config = replace(
+                self.reward_config,
+                target_azimuth_deg=state.m_azimuth_DEG,
+            )
+        self._last_longitudinal_position_rate_mps = 0.0
         self._last_state = state
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile == ELEVATOR_HOVER_TASK
+            else None
+        )
         readiness = self.compute_episode_start_status(state)
         lifecycle = EpisodeLifecycleResult(
             ready=readiness.ready,
@@ -473,7 +716,10 @@ class HoverPilotHoverEnv(gym.Env):
             truncated=False,
             reason=episode_start_reason,
         )
-        observation = state_to_observation(state)
+        observation = self._state_to_observation(
+            state,
+            elevator_features=elevator_features,
+        )
         info = self._build_info(
             state=state,
             reward_breakdown=None,
@@ -484,6 +730,7 @@ class HoverPilotHoverEnv(gym.Env):
             lifecycle=lifecycle,
             readiness=readiness,
             ground_contact_duration_s=0.0,
+            elevator_features=elevator_features,
         )
         return observation, info
 
@@ -491,7 +738,7 @@ class HoverPilotHoverEnv(gym.Env):
         self,
         *,
         state: FlightAxisState,
-        reward_breakdown,
+        reward_breakdown: Optional[RewardBreakdown],
         truncated: bool,
         reset: bool,
         episode_start_reason: Optional[str],
@@ -499,36 +746,48 @@ class HoverPilotHoverEnv(gym.Env):
         lifecycle: EpisodeLifecycleResult,
         readiness: EpisodeLifecycleResult,
         ground_contact_duration_s: float,
+        elevator_features: Optional[ElevatorHoverFeatures] = None,
     ) -> Dict[str, Any]:
+        debug_state = {
+            "x_m": state.m_aircraftPositionX_MTR,
+            "y_m": state.m_aircraftPositionY_MTR,
+            "altitude_agl_m": state.m_altitudeAGL_MTR,
+            "roll_deg": state.m_roll_DEG,
+            "azimuth_deg": state.m_azimuth_DEG,
+            "inclination_deg": state.m_inclination_DEG,
+            "pitch_rate_deg_s": state.m_pitchRate_DEGpSEC,
+            "velocity_world_u_mps": state.m_velocityWorldU_MPS,
+            "velocity_world_v_mps": state.m_velocityWorldV_MPS,
+            "velocity_world_w_mps": state.m_velocityWorldW_MPS,
+            "controller_active": state.m_flightAxisControllerIsActive,
+            "physics_time_s": state.m_currentPhysicsTime_SEC,
+            "reset_button_pressed": state.m_resetButtonHasBeenPressed,
+            "lost_components": state.m_hasLostComponents,
+            "aircraft_status": state.m_currentAircraftStatus,
+            "touching_ground": state.m_isTouchingGround,
+            "engine_running": state.m_anEngineIsRunning,
+            "vehicle_locked": state.m_isLocked,
+            "ground_contact_duration_s": ground_contact_duration_s,
+        }
+        debug_state["distance_from_cylinder_axis_m"] = math.hypot(
+            state.m_aircraftPositionX_MTR
+            - self.reward_config.target_x_m,
+            state.m_aircraftPositionY_MTR
+            - self.reward_config.target_y_m,
+        )
+
         info = {  # type: Dict[str, Any]
             "state_summary": state.summary(),
-            "debug_state": {
-                "x_m": state.m_aircraftPositionX_MTR,
-                "y_m": state.m_aircraftPositionY_MTR,
-                "altitude_agl_m": state.m_altitudeAGL_MTR,
-                "controller_active": state.m_flightAxisControllerIsActive,
-                "physics_time_s": state.m_currentPhysicsTime_SEC,
-                "reset_button_pressed": state.m_resetButtonHasBeenPressed,
-                "lost_components": state.m_hasLostComponents,
-                "aircraft_status": state.m_currentAircraftStatus,
-                "touching_ground": state.m_isTouchingGround,
-                "engine_running": state.m_anEngineIsRunning,
-                "vehicle_locked": state.m_isLocked,
-                "ground_contact_duration_s": ground_contact_duration_s,
-                "ready_controller_active_threshold": self.ready_controller_active_threshold,
-                "ready_running_threshold": self.ready_running_threshold,
-                "ready_locked_threshold": self.ready_locked_threshold,
-                "minimum_start_altitude_agl_m": self.minimum_start_altitude_agl_m,
-                "start_groundspeed_threshold_mps": self.start_groundspeed_threshold_mps,
-                "start_airspeed_threshold_mps": self.start_airspeed_threshold_mps,
-                "start_body_rate_threshold_deg_s": self.start_body_rate_threshold_deg_s,
-                "reposition_speed_threshold_mps": self.reposition_speed_threshold_mps,
-                "reset_teleport_distance_m": self.reset_teleport_distance_m,
-            },
+            "debug_state": debug_state,
             "target_hover": {
                 "x_m": self.reward_config.target_x_m,
                 "y_m": self.reward_config.target_y_m,
                 "altitude_agl_m": self.reward_config.target_altitude_agl_m,
+                "roll_deg": self.reward_config.target_roll_deg,
+                "inclination_deg": (
+                    self.task_profile.realflight_reference_inclination_deg
+                ),
+                "azimuth_deg": self.reward_config.target_azimuth_deg,
             },
             "episode_step": self._episode_steps,
             "reset": reset,
@@ -541,6 +800,30 @@ class HoverPilotHoverEnv(gym.Env):
         if reward_breakdown is not None:
             info["reward_breakdown"] = asdict(reward_breakdown)
             info["termination_reason"] = reward_breakdown.termination_reason
+        if self.task_profile == ELEVATOR_HOVER_TASK:
+            features = (
+                elevator_features
+                if elevator_features is not None
+                else self._compute_elevator_features(state)
+            )
+            info["elevator_hover_features"] = asdict(features)
+            info["elevator_recovery_target_deg"] = (
+                reward_breakdown.target_inclination_error_deg
+                if reward_breakdown is not None
+                else compute_elevator_recovery_target_deg(
+                    features.longitudinal_position_error_m,
+                    features.longitudinal_velocity_mps,
+                    position_gain_deg_per_m=(
+                        self.reward_config.elevator_recovery_position_gain_deg_per_m
+                    ),
+                    velocity_gain_deg_per_mps=(
+                        self.reward_config.elevator_recovery_velocity_gain_deg_per_mps
+                    ),
+                    inclination_limit_deg=(
+                        self.reward_config.elevator_recovery_inclination_limit_deg
+                    ),
+                )
+            )
         return info
 
     def _detect_trainer_reset(self, state: FlightAxisState) -> Optional[str]:
@@ -590,22 +873,32 @@ class HoverPilotHoverEnv(gym.Env):
             f"locked={state.m_isLocked:.1f} lost={state.m_hasLostComponents:.1f} "
             f"engine={state.m_anEngineIsRunning:.1f} ctrl={state.m_flightAxisControllerIsActive:.1f} "
             f"ground={state.m_isTouchingGround:.1f} status={state.m_currentAircraftStatus:.1f} "
-            f"physics_t={state.m_currentPhysicsTime_SEC:.3f}"
+            f"inc={state.m_inclination_DEG:.1f} gs={state.m_groundspeed_MPS:.2f} "
+            f"air={state.m_airspeed_MPS:.2f} physics_t={state.m_currentPhysicsTime_SEC:.3f}"
         )
 
     def _looks_like_reset_teleport(self, previous_state: FlightAxisState, state: FlightAxisState) -> bool:
         # RealFlight Hover Trainer does not always expose a dedicated reset flag.
         # As a fallback, treat a sudden jump out of a crash-wait state as a
-        # trainer-driven reposition rather than an out-of-bounds failure.
-        if self._planar_distance(previous_state, state) < self.reset_teleport_distance_m:
-            return False
+        # trainer-driven reposition rather than a boundary failure.
         if not self.compute_episode_start_status(state).ready:
             return False
-        if self._is_reset_like_stationary_state(state) and self._is_inactive_reset_state(state):
+        if (
+            self._is_low_altitude_wait_state(previous_state)
+            and not self._is_low_altitude_wait_state(state)
+            and (
+                state.m_altitudeAGL_MTR
+                - previous_state.m_altitudeAGL_MTR
+                >= self.reset_teleport_distance_m / 2.0
+            )
+        ):
             return True
-        if self._is_low_altitude_wait_state(previous_state) and not self._is_low_altitude_wait_state(state):
-            return True
-        return False
+        return (
+            self._planar_distance(previous_state, state)
+            >= self.reset_teleport_distance_m
+            and self._is_reset_like_stationary_state(state)
+            and self._is_inactive_reset_state(state)
+        )
 
     def _assess_episode_boundary(
         self,
@@ -621,11 +914,11 @@ class HoverPilotHoverEnv(gym.Env):
         if effective_reset_reason in TRAINER_RESET_REASONS and not self._is_low_altitude_wait_state(state):
             pre_reset_wait = False
         can_start = readiness.ready and not pre_reset_wait
+        if can_start and not self._is_start_stable_state(state):
+            can_start = False
         if can_start and effective_reset_reason in TRAINER_RESET_REASONS:
             return EpisodeBoundaryAssessment(readiness, reset_reason, True, pre_reset_wait)
         if can_start and require_reset_boundary:
-            can_start = False
-        if can_start and not self._is_start_stable_state(state):
             can_start = False
         if can_start and self._is_reset_like_stationary_state(state) and self._is_inactive_reset_state(state):
             can_start = False
@@ -657,8 +950,17 @@ class HoverPilotHoverEnv(gym.Env):
     def _is_start_stable_state(self, state: FlightAxisState) -> bool:
         # A valid episode start should not begin mid-crash or mid-fall. Require a
         # modestly stable state before declaring the episode active.
+        attitude_ready = (
+            not self.task_profile.require_vertical_start
+            or abs(
+                state.m_inclination_DEG
+                - REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG
+            )
+            <= self.elevator_start_inclination_tolerance_deg
+        )
         return (
-            state.m_groundspeed_MPS <= self.start_groundspeed_threshold_mps
+            attitude_ready
+            and state.m_groundspeed_MPS <= self.start_groundspeed_threshold_mps
             and state.m_airspeed_MPS <= self.start_airspeed_threshold_mps
             and abs(state.m_pitchRate_DEGpSEC) <= self.start_body_rate_threshold_deg_s
             and abs(state.m_rollRate_DEGpSEC) <= self.start_body_rate_threshold_deg_s

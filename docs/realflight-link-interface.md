@@ -10,7 +10,9 @@ RealFlight Link 연결은 TCP 기반 SOAP over HTTP 형태로 동작한다.
 - 연결 방식: `socket.AF_INET`, `SOCK_STREAM`
 - 요청 형태: `POST / HTTP/1.1`
 - 콘텐츠 타입: `text/xml;charset='UTF-8'`
-- 연결 정책: `Connection: Keep-Alive`
+- 연결 정책: `Connection: Keep-Alive` 요청을 기본으로 사용하되, RealFlight가
+  `Connection: close`로 응답하거나 완료된 응답 뒤 socket을 닫으면 controller
+  상태를 유지한 채 다음 `ExchangeData` 요청부터 새 TCP 연결을 사용한다.
 
 클라이언트는 아래 순서로 동작한다.
 

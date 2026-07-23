@@ -62,18 +62,33 @@ Action format is a 4-element `float32` array:
 - index 2: `throttle` in `[0, 1]`
 - index 3: `rudder` in `[-1, 1]`
 
-Observation format is a compact 12-element `float32` vector for hover training:
+Observation format is a normalized 13-element `float32` vector for hover training:
 
-- position: `x`, `y`, `altitude_agl`
-- attitude: `roll`, `inclination`, `azimuth`
-- world velocity: `u`, `v`, `w`
-- angular rates: `pitch_rate`, `roll_rate`, `yaw_rate`
+- target-relative position: scaled `x_error`, `y_error`, `altitude_error`
+- attitude: scaled `roll`, scaled `inclination`, `sin(azimuth)`, `cos(azimuth)`
+- scaled world velocity: `u`, `v`, `w`
+- scaled angular rates: `pitch_rate`, `roll_rate`, `yaw_rate`
+
+Elevator-only PPO uses a compact 6-element longitudinal observation instead:
+
+- inclination tracking error relative to the position/velocity recovery target;
+  nose-up hover at the origin is `0°`
+- pitch rate
+- horizontal position error projected onto the reset heading
+- horizontal velocity projected onto the reset heading
+- altitude error
+- vertical world velocity
+
+Observations are clipped to `[-5, 5]`. The PPO policy uses a tanh-squashed
+Gaussian distribution so sampled actions stay inside the RealFlight channel
+bounds without breaking the PPO log-probability ratio. Throttle is mapped to
+`[0, 1]`; the other three channels are mapped to `[-1, 1]`.
 
 Reward and termination are integrated from `hoverpilot.training.hover`:
 
 - reward prefers staying near the target hover point and upright attitude
 - boundary proximity adds a growing penalty before failure
-- terminal failures include trainer boundary exit, altitude bounds, lost components, locked vehicle states, configured controller inactivity, configured engine stop, and post-start ground contact
+- terminal failures include trainer cylinder exit, minimum-altitude failure, lost components, locked vehicle states, configured controller inactivity, configured engine stop, and post-start ground contact
 
 `reset()` waits for a usable start state before returning. During this warmup the environment keeps sending a safe idle action and polls RealFlight until readiness is satisfied or a timeout is reached.
 
@@ -126,8 +141,8 @@ Episode end:
 
 - Hard terminal failures include:
   - `m_hasLostComponents > threshold`
-  - boundary exit in `x` or `y`
-  - altitude too low / too high
+  - exit from the trainer cylinder
+  - altitude too low
   - locked vehicle state
   - configured controller inactive / engine stopped conditions
   - post-start ground contact after the configured grace period
@@ -298,42 +313,107 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
-Training writes TensorBoard logs to `runs/hoverpilot-ppo` by default.
+For a RealFlight Hover Trainer configuration where PPO controls only elevator,
+use a one-dimensional policy and keep the other transmitted channels fixed:
 
-Customize training with additional options:
+First verify that positive and negative elevator commands create opposite
+pitch-rate responses. Reset Airplane Hover Trainer immediately before running:
 
 ```bash
-uv run hoverpilot-ppo train --timesteps 50000 \
-  --save-path ppo_hoverpilot.pt \
-  --max-episode-steps 300 \
-  --n-steps 2048 \
-  --batch-size 128 \
-  --epochs 10 \
-  --learning-rate 3e-4 \
-  --gamma 0.99 \
-  --gae-lambda 0.95 \
-  --clip-epsilon 0.2 \
-  --value-coef 0.5 \
-  --entropy-coef 0.01 \
-  --max-grad-norm 0.5 \
-  --eval-episodes 5 \
-  --log-interval 10 \
-  --tensorboard-log-dir runs/hoverpilot-ppo-exp1 \
+uv run hoverpilot-ppo diagnose-elevator \
+  --elevator-fixed-throttle 0.55 \
+  --pulse 0.1
+```
+
+The diagnostic limits the pulse to `0.25`, records the neutral state before
+each direction, and returns elevator to neutral on completion or failure. It
+warns when the two pulses start from materially different pitch-rate or
+inclination conditions, since that makes the polarity comparison unreliable.
+Reset and repeat the diagnostic before training if either that warning appears
+or the responses have the same sign.
+
+```bash
+uv run hoverpilot-ppo train --control-mode elevator \
+  --elevator-fixed-throttle 0.55 \
+  --rflink-socket-timeout-s 3 \
+  --rflink-request-attempts 4 \
+  --checkpoint-interval-steps 1024 \
+  --save-path ppo_hoverpilot_elevator.pt \
+  --tensorboard-log-dir runs/hoverpilot-ppo-elevator \
   --seed 42
 ```
 
-The PPO CLI now exposes these tuning parameters directly:
+RealFlight reports raw `m_inclination=90°` for the vertical, nose-up hover
+attitude. Elevator mode converts that to a signed control error of `0°`.
+Because azimuth flips by 180° at this Euler singularity, the signed error is
+computed as `(inclination - 90°) * cos(azimuth - reset heading)`. This lets the
+policy distinguish equal tilts on opposite sides of vertical. Position,
+altitude, and heading are anchored at each trainer reset. Position and
+longitudinal position rate command a signed target inclination, limited to
+`30°`; at the origin the target remains the vertical `0°` error. The position
+rate is calculated directly from consecutive positions and RealFlight physics
+time rather than relying on the simulator U/V velocity polarity, which can
+flip between vertical-hover resets. The target uses
+`-(2 × position + 3 × position_rate)`: outward motion strengthens recovery
+while inward motion starts braking before crossing the origin. This
+state-dependent target is active from the beginning: small errors request a
+small tilt, while large outward drift can immediately request the full `30°`.
+The policy observes inclination relative to that recovery target rather than
+raw vertical error.
 
-- `--n-steps`
-- `--batch-size`
-- `--epochs`
-- `--learning-rate`
-- `--gamma`
-- `--gae-lambda`
-- `--clip-epsilon`
-- `--value-coef`
-- `--entropy-coef`
-- `--max-grad-norm`
+The PPO-only elevator actor has two learned positive gains for attitude and
+pitch rate. Mirroring inclination, pitch rate, position, and longitudinal
+velocity therefore mirrors the elevator command, and the restoring sign cannot
+reverse. The critic retains its nonlinear network, but the actor has no
+separate MLP or direct position term that could cancel the recovery target.
+Unlike `elevator-pd`, it injects no fixed prior or bounded residual.
+
+Elevator training defaults to 300,000 steps, a `1e-4` learning rate, `0.08`
+initial policy standard deviation, `0.0001` entropy coefficient, and 10 final
+evaluation episodes. These settings use conservative exploration while keeping
+the rollout on-policy. `--policy-preset none` is the default; the optional
+`--policy-preset elevator-pd` supplies measured-sign restoring control while
+PPO learns a bounded residual. Compare both presets when the goal is to
+distinguish learned PPO performance from controller assistance.
+
+Each trainer reposition defines a new local three-dimensional origin. The reset
+position is `(x=0, y=0, z=0)`, where `z` is altitude AGL relative to the reset
+altitude. The trainer boundary is modeled as a vertical cylinder with a 6 m
+horizontal radius around the reset x/y position. Altitude does not reduce the
+available horizontal radius, and no unverified upper ceiling is imposed. A new
+process also requires the aircraft to be within 0.5° of the vertical attitude
+before accepting a state as an episode start, so an in-progress fall is not
+re-anchored as a new origin.
+
+Continue training a structured elevator checkpoint with:
+
+```bash
+uv run hoverpilot-ppo train --control-mode elevator \
+  --resume-from ppo_hoverpilot_elevator.pt \
+  --save-path ppo_hoverpilot_elevator_continued.pt \
+  --timesteps 10000
+```
+
+HoverPilot PPO checkpoints use structured format v2. They record policy/value
+weights, control mode, policy preset, fixed elevator throttle, and the
+observation/recovery scaling configuration. Version 1 checkpoints are rejected
+because their observation and actor definitions are incompatible.
+When resuming, `--control-mode` must match the checkpoint; the saved policy
+preset and fixed throttle take precedence over their command-line defaults.
+The optimizer is recreated with the command's current learning rate and tuning
+options.
+
+Training writes TensorBoard logs to `runs/hoverpilot-ppo` by default.
+
+List all training options with:
+
+```bash
+uv run hoverpilot-ppo train --help
+```
+
+The task-specific switches are `--control-mode`, `--policy-preset`,
+`--elevator-fixed-throttle`, `--resume-from`, and
+`--checkpoint-interval-steps`.
 
 To disable TensorBoard logging for a run:
 
@@ -354,12 +434,32 @@ Useful TensorBoard scalars include:
 - `train/episode_reward`
 - `train/episode_length`
 - `train/reward_mean`
+- `train/optimization_reward_mean`
 - `train/action/throttle_mean`
 - `train/termination/parked_on_ground`
 - `train/policy_loss`
 - `train/value_loss`
 - `train/entropy`
+- `train/ratio`, `train/ratio_min`, `train/ratio_max`
+- `train/approx_kl`
+- `train/clip_fraction`
+- `train/update_epochs`, `train/kl_early_stop`
+- `train/value_mean`, `train/value_std`, `train/explained_variance`
+- `train/action/<channel>_saturation_fraction`
+- `train/control/elevator_action`
+- `train/state/inclination_error_deg`, `train/state/abs_inclination_error_deg`
+- `train/state/target_inclination_error_deg`
+- `train/state/inclination_tracking_error_deg`
+- `train/state/pitch_rate_deg_s`, `train/state/abs_pitch_rate_deg_s`
+- `train/state/longitudinal_error_m`, `train/state/longitudinal_velocity_mps`
+- `train/state/radial_distance_m`
+- `train/recovery_probe/*`,
+  `train/recovery_probe/minimum_restoring_margin`,
+  `train/recovery_probe/effective_restoring_fraction`
 - `eval/avg_reward`
+- `eval/reward_per_step`
+- `eval/position_error_m`, `eval/altitude_error_m`, `eval/attitude_error_deg`
+- `eval/termination/*`, `eval/termination_rate/*`
 
 Validate the environment before training:
 
@@ -374,6 +474,11 @@ This validation command helps confirm:
 - action scaling across the drone control channels
 - reward and termination signals during short episodes
 - whether boundary termination is firing too aggressively
+
+For an elevator-only curriculum, begin with the smallest Airplane Hover Trainer
+disturbance setting. Increase the trainer's initial angular/position
+perturbations only after deterministic evaluation consistently reaches the
+episode time limit with decreasing inclination and pitch-rate errors.
 
 ## License
 
