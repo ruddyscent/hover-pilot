@@ -19,7 +19,6 @@ from hoverpilot.envs import (
     gym_action_to_rf_action,
     rudder_features_to_observation,
     rudder_throttle_features_to_observation,
-    state_to_observation,
     throttle_features_to_observation,
 )
 from hoverpilot.envs.hover_env import EpisodeLifecycleResult
@@ -27,6 +26,11 @@ from hoverpilot.rflink.models import FlightAxisState, RFControlAction
 from hoverpilot.training.hover import (
     AileronHoverFeatures,
     ElevatorHoverFeatures,
+    HOVER_TARGET_ALTITUDE_AGL_M,
+    HOVER_TARGET_GROUNDSPEED_MPS,
+    HOVER_TARGET_INCLINATION_DEG,
+    HOVER_TARGET_X_M,
+    HOVER_TARGET_Y_M,
     RewardConfig,
     RudderHoverFeatures,
     ThrottleHoverFeatures,
@@ -63,11 +67,11 @@ class StubRFLinkClient:
 class HoverEnvTests(unittest.TestCase):
     def _state(self, **overrides):
         state = FlightAxisState(
-            m_aircraftPositionX_MTR=0.0,
-            m_aircraftPositionY_MTR=0.0,
-            m_altitudeAGL_MTR=1.5,
+            m_aircraftPositionX_MTR=HOVER_TARGET_X_M,
+            m_aircraftPositionY_MTR=HOVER_TARGET_Y_M,
+            m_altitudeAGL_MTR=HOVER_TARGET_ALTITUDE_AGL_M,
             m_roll_DEG=0.0,
-            m_inclination_DEG=0.0,
+            m_inclination_DEG=90.0,
             m_azimuth_DEG=0.0,
             m_velocityWorldU_MPS=0.0,
             m_velocityWorldV_MPS=0.0,
@@ -96,36 +100,6 @@ class HoverEnvTests(unittest.TestCase):
         self.assertEqual(action.elevator, -1.0)
         self.assertEqual(action.throttle, 1.0)
         self.assertEqual(action.rudder, -0.25)
-
-    def test_observation_vector_shape_and_dtype(self):
-        observation = state_to_observation(self._state())
-
-        self.assertEqual(observation.shape, (13,))
-        self.assertEqual(observation.dtype, np.float32)
-        np.testing.assert_allclose(observation, np.asarray([0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0], dtype=np.float32))
-
-    def test_observation_is_relative_to_hover_target_and_scaled(self):
-        observation = state_to_observation(
-            self._state(
-                m_aircraftPositionX_MTR=10.0,
-                m_aircraftPositionY_MTR=-4.0,
-                m_altitudeAGL_MTR=4.5,
-                m_roll_DEG=45.0,
-                m_inclination_DEG=-45.0,
-                m_azimuth_DEG=90.0,
-                m_velocityWorldU_MPS=5.0,
-                m_pitchRate_DEGpSEC=90.0,
-            ),
-            target_x_m=2.0,
-            target_y_m=4.0,
-            target_altitude_agl_m=1.5,
-        )
-
-        np.testing.assert_allclose(
-            observation,
-            np.asarray([1, -1, 1, 1, -1, 1, 0, 0.5, 0, 0, 0.5, 0, 0], dtype=np.float32),
-            atol=1.0e-6,
-        )
 
     def test_elevator_observation_contains_only_longitudinal_control_state(self):
         config = RewardConfig(
@@ -300,22 +274,28 @@ class HoverEnvTests(unittest.TestCase):
 
         np.testing.assert_allclose(
             reset_observation,
-            [-0.2 / 1.5, 0.0],
+            [-0.7 / 1.5, 0.0],
         )
         np.testing.assert_allclose(
             observation,
-            [-0.1 / 1.5, 0.1],
+            [-0.6 / 1.5, 0.1],
         )
         self.assertEqual(
             reset_info["target_hover"]["altitude_agl_m"],
-            1.5,
+            HOVER_TARGET_ALTITUDE_AGL_M,
         )
-        self.assertEqual(reset_info["target_hover"]["x_m"], 12.0)
-        self.assertEqual(reset_info["target_hover"]["y_m"], -3.0)
+        self.assertEqual(
+            reset_info["target_hover"]["x_m"],
+            HOVER_TARGET_X_M,
+        )
+        self.assertEqual(
+            reset_info["target_hover"]["y_m"],
+            HOVER_TARGET_Y_M,
+        )
         self.assertAlmostEqual(client.actions[0].throttle, 0.65)
         self.assertAlmostEqual(
             info["throttle_hover_features"]["altitude_error_m"],
-            -0.1,
+            -0.6,
         )
         self.assertEqual(
             info["throttle_hover_features"]["vertical_velocity_mps"],
@@ -351,7 +331,7 @@ class HoverEnvTests(unittest.TestCase):
             [0.5, -0.5, 0.5, -0.5],
         )
 
-    def test_aileron_throttle_targets_survive_connection_episode_boundary(self):
+    def test_aileron_throttle_keeps_fixed_position_target_across_boundaries(self):
         env = HoverPilotHoverEnv(
             host="test",
             port=18083,
@@ -383,9 +363,12 @@ class HoverEnvTests(unittest.TestCase):
         env._start_episode_from_state(first, "reset_ready")
         env._start_episode_from_state(drifted, "reset_ready")
 
-        self.assertEqual(env.reward_config.target_x_m, 12.0)
-        self.assertEqual(env.reward_config.target_y_m, -3.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 2.0)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env.reward_config.target_roll_deg, 7.0)
 
         env._start_episode_from_state(
@@ -393,9 +376,12 @@ class HoverEnvTests(unittest.TestCase):
             "trainer_repositioned",
         )
 
-        self.assertEqual(env.reward_config.target_x_m, 1.0)
-        self.assertEqual(env.reward_config.target_y_m, 2.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 1.8)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env.reward_config.target_roll_deg, -4.0)
 
     def test_rudder_throttle_observation_combines_only_enabled_axes(self):
@@ -416,7 +402,7 @@ class HoverEnvTests(unittest.TestCase):
             [1.0, -1.0, 0.5, -0.5],
         )
 
-    def test_rudder_throttle_target_survives_connection_episode_boundary(self):
+    def test_rudder_throttle_keeps_fixed_position_target_across_boundaries(self):
         env = HoverPilotHoverEnv(
             host="test",
             port=18083,
@@ -446,16 +432,22 @@ class HoverEnvTests(unittest.TestCase):
         env._rudder_angle_error_deg = 9.0
         env._start_episode_from_state(drifted, "reset_ready")
 
-        self.assertEqual(env.reward_config.target_x_m, 12.0)
-        self.assertEqual(env.reward_config.target_y_m, -3.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 2.0)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env._rudder_angle_error_deg, 0.0)
 
         env._start_episode_from_state(repositioned, "trainer_repositioned")
 
-        self.assertEqual(env.reward_config.target_x_m, 1.0)
-        self.assertEqual(env.reward_config.target_y_m, 2.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 1.8)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
 
     def test_elevator_throttle_observation_uses_upward_positive_velocity(self):
         observation = elevator_throttle_features_to_observation(
@@ -475,7 +467,7 @@ class HoverEnvTests(unittest.TestCase):
             [0.0, 0.0, 0.0, 0.0, 0.5, 0.5],
         )
 
-    def test_elevator_throttle_target_survives_connection_episode_boundary(self):
+    def test_elevator_throttle_keeps_fixed_position_target_across_boundaries(self):
         env = HoverPilotHoverEnv(
             host="test",
             port=18083,
@@ -507,9 +499,12 @@ class HoverEnvTests(unittest.TestCase):
         env._start_episode_from_state(first, "reset_ready")
         env._start_episode_from_state(drifted, "reset_ready")
 
-        self.assertEqual(env.reward_config.target_x_m, 12.0)
-        self.assertEqual(env.reward_config.target_y_m, -3.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 2.0)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env.reward_config.target_azimuth_deg, 37.0)
 
         env._start_episode_from_state(
@@ -517,17 +512,17 @@ class HoverEnvTests(unittest.TestCase):
             "trainer_repositioned",
         )
 
-        self.assertEqual(env.reward_config.target_x_m, 1.0)
-        self.assertEqual(env.reward_config.target_y_m, 2.0)
-        self.assertEqual(env.reward_config.target_altitude_agl_m, 1.8)
+        self.assertEqual(env.reward_config.target_x_m, HOVER_TARGET_X_M)
+        self.assertEqual(env.reward_config.target_y_m, HOVER_TARGET_Y_M)
+        self.assertEqual(
+            env.reward_config.target_altitude_agl_m,
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env.reward_config.target_azimuth_deg, 10.0)
 
     def test_elevator_profile_anchors_heading_and_zeroes_nose_up_error(self):
         client = StubRFLinkClient([
             self._state(
-                m_aircraftPositionX_MTR=12.5,
-                m_aircraftPositionY_MTR=-3.0,
-                m_altitudeAGL_MTR=4.2,
                 m_azimuth_DEG=37.0,
                 m_inclination_DEG=90.0,
             ),
@@ -552,17 +547,80 @@ class HoverEnvTests(unittest.TestCase):
             0.0,
         )
         self.assertEqual(info["elevator_recovery_target_deg"], 0.0)
-        self.assertEqual(info["target_hover"]["x_m"], 12.5)
-        self.assertEqual(info["target_hover"]["y_m"], -3.0)
-        self.assertEqual(info["target_hover"]["altitude_agl_m"], 4.2)
+        self.assertEqual(info["target_hover"]["x_m"], HOVER_TARGET_X_M)
+        self.assertEqual(info["target_hover"]["y_m"], HOVER_TARGET_Y_M)
+        self.assertEqual(
+            info["target_hover"]["altitude_agl_m"],
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
         self.assertEqual(env.reward_config.trainer_cylinder_radius_m, 6.0)
         env.close()
+
+    def test_all_profiles_use_the_fixed_world_hover_target(self):
+        start = self._state(
+            m_aircraftPositionX_MTR=12.5,
+            m_aircraftPositionY_MTR=-3.0,
+            m_altitudeAGL_MTR=4.2,
+        )
+
+        for profile in (
+            STANDARD_HOVER_TASK,
+            ELEVATOR_HOVER_TASK,
+            AILERON_HOVER_TASK,
+            RUDDER_HOVER_TASK,
+            THROTTLE_HOVER_TASK,
+            ELEVATOR_THROTTLE_HOVER_TASK,
+            AILERON_THROTTLE_HOVER_TASK,
+            RUDDER_THROTTLE_HOVER_TASK,
+        ):
+            with self.subTest(profile=profile.value):
+                env = HoverPilotHoverEnv(
+                    host="test",
+                    port=18083,
+                    reward_config=RewardConfig(
+                        target_x_m=99.0,
+                        target_y_m=-99.0,
+                        target_altitude_agl_m=9.0,
+                    ),
+                    task_profile=profile,
+                    client_factory=lambda: StubRFLinkClient([]),
+                )
+
+                _, info = env._start_episode_from_state(
+                    start,
+                    "reset_ready",
+                )
+
+                self.assertEqual(
+                    env.reward_config.target_x_m,
+                    HOVER_TARGET_X_M,
+                )
+                self.assertEqual(
+                    env.reward_config.target_y_m,
+                    HOVER_TARGET_Y_M,
+                )
+                self.assertEqual(
+                    env.reward_config.target_altitude_agl_m,
+                    HOVER_TARGET_ALTITUDE_AGL_M,
+                )
+                self.assertEqual(
+                    info["target_hover"]["inclination_deg"],
+                    HOVER_TARGET_INCLINATION_DEG,
+                )
+                self.assertEqual(
+                    env.reward_config.target_groundspeed_mps,
+                    HOVER_TARGET_GROUNDSPEED_MPS,
+                )
+                self.assertEqual(
+                    info["target_hover"]["groundspeed_mps"],
+                    HOVER_TARGET_GROUNDSPEED_MPS,
+                )
 
     def test_elevator_observation_uses_recovery_tracking_error(self):
         config = RewardConfig(target_azimuth_deg=0.0)
         features = compute_elevator_hover_features(
             self._state(
-                m_aircraftPositionY_MTR=-4.0,
+                m_aircraftPositionY_MTR=HOVER_TARGET_Y_M - 4.0,
                 m_inclination_DEG=90.0,
             ),
             target_x_m=config.target_x_m,
@@ -587,11 +645,11 @@ class HoverEnvTests(unittest.TestCase):
         )
         env.reward_config = RewardConfig(target_azimuth_deg=0.0)
         env._last_state = self._state(
-            m_aircraftPositionY_MTR=0.0,
+            m_aircraftPositionY_MTR=HOVER_TARGET_Y_M,
             m_currentPhysicsTime_SEC=10.0,
         )
         current = self._state(
-            m_aircraftPositionY_MTR=-0.5,
+            m_aircraftPositionY_MTR=HOVER_TARGET_Y_M - 0.5,
             m_velocityWorldV_MPS=99.0,
             m_currentPhysicsTime_SEC=10.5,
         )
@@ -606,7 +664,7 @@ class HoverEnvTests(unittest.TestCase):
             [
                 self._state(m_inclination_DEG=90.0),
                 self._state(
-                    m_aircraftPositionY_MTR=-0.5,
+                    m_aircraftPositionY_MTR=HOVER_TARGET_Y_M - 0.5,
                     m_inclination_DEG=90.0,
                     m_velocityWorldV_MPS=99.0,
                     m_currentPhysicsTime_SEC=10.5,
@@ -778,7 +836,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(info["episode_start_reason"], "reset_ready")
         self.assertTrue(info["episode_readiness"]["ready"])
         self.assertEqual(len(client.actions), 2)
@@ -826,7 +884,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertTrue(info["episode_readiness"]["ready"])
         self.assertEqual(info["episode_start_reason"], "trainer_repositioned")
         self.assertEqual(len(client.actions), 2)
@@ -872,7 +930,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertTrue(info["episode_readiness"]["ready"])
         self.assertEqual(info["episode_start_reason"], "trainer_repositioned")
         self.assertEqual(len(client.actions), 2)
@@ -918,7 +976,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(info["episode_start_reason"], "trainer_repositioned")
         self.assertEqual(len(client.actions), 2)
         env.close()
@@ -966,7 +1024,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertTrue(info["episode_readiness"]["ready"])
         self.assertEqual(info["episode_start_reason"], "trainer_repositioned")
         self.assertEqual(len(client.actions), 2)
@@ -1003,7 +1061,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(info["episode_start_reason"], "trainer_repositioned")
         self.assertEqual(len(client.actions), 2)
         env.close()
@@ -1030,7 +1088,6 @@ class HoverEnvTests(unittest.TestCase):
             host="127.0.0.1",
             port=18083,
             client_factory=lambda: client,
-            anchor_target_to_reset_state=False,
         )
         env.reset()
 
@@ -1043,7 +1100,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, next_info = env.wait_for_next_episode(action=np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32))
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(next_info["episode_start_reason"], "trainer_repositioned")
         env.close()
 
@@ -1089,7 +1146,6 @@ class HoverEnvTests(unittest.TestCase):
             host="127.0.0.1",
             port=18083,
             client_factory=lambda: client,
-            anchor_target_to_reset_state=False,
         )
         env.reset()
 
@@ -1102,7 +1158,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, next_info = env.wait_for_next_episode(action=np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32))
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(next_info["episode_start_reason"], "trainer_repositioned")
         env.close()
 
@@ -1116,16 +1172,53 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
+        np.testing.assert_allclose(observation, np.zeros(14))
         self.assertIs(env.task_profile, STANDARD_HOVER_TASK)
         self.assertIsInstance(info, dict)
         self.assertIn("state_summary", info)
         self.assertEqual(info["episode_start_reason"], "reset_ready")
         self.assertTrue(client.connected)
         self.assertIsInstance(client.actions[0], RFControlAction)
+        self.assertAlmostEqual(client.actions[0].aileron, 0.78)
+        self.assertAlmostEqual(client.actions[0].throttle, 0.65)
+        self.assertIn("elevator_hover_features", info)
+        self.assertIn("aileron_hover_features", info)
+        self.assertIn("rudder_hover_features", info)
+        self.assertIn("throttle_hover_features", info)
         env.close()
 
-    def test_reset_anchors_target_to_current_state_by_default(self):
+    def test_standard_mode_integrates_body_roll_rate_across_euler_jump(self):
+        client = StubRFLinkClient([
+            self._state(),
+            self._state(
+                m_currentPhysicsTime_SEC=10.1,
+                m_roll_DEG=170.0,
+                m_rollRate_DEGpSEC=10.0,
+            ),
+        ])
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            client_factory=lambda: client,
+        )
+        env.reset()
+
+        _, _, _, _, info = env.step(
+            np.asarray([0.78, 0.0, 0.65, 0.0], dtype=np.float32)
+        )
+
+        self.assertAlmostEqual(
+            info["aileron_hover_features"]["roll_error_deg"],
+            1.0,
+        )
+        self.assertEqual(
+            info["aileron_hover_features"]["roll_rate_deg_s"],
+            10.0,
+        )
+        env.close()
+
+    def test_reset_keeps_fixed_world_hover_target(self):
         client = StubRFLinkClient([
             self._state(m_aircraftPositionX_MTR=12.5, m_aircraftPositionY_MTR=-3.0, m_altitudeAGL_MTR=4.2)
         ])
@@ -1137,9 +1230,13 @@ class HoverEnvTests(unittest.TestCase):
 
         _, info = env.reset()
 
-        self.assertEqual(info["target_hover"]["x_m"], 12.5)
-        self.assertEqual(info["target_hover"]["y_m"], -3.0)
-        self.assertEqual(info["target_hover"]["altitude_agl_m"], 4.2)
+        self.assertEqual(info["target_hover"]["x_m"], HOVER_TARGET_X_M)
+        self.assertEqual(info["target_hover"]["y_m"], HOVER_TARGET_Y_M)
+        self.assertEqual(
+            info["target_hover"]["altitude_agl_m"],
+            HOVER_TARGET_ALTITUDE_AGL_M,
+        )
+        self.assertEqual(info["target_hover"]["inclination_deg"], 90.0)
         env.close()
 
     def test_locked_state_is_not_ready(self):
@@ -1206,7 +1303,7 @@ class HoverEnvTests(unittest.TestCase):
 
         self.assertEqual(len(result), 5)
         observation, reward, terminated, truncated, info = result
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertIsInstance(reward, float)
         self.assertIsInstance(terminated, bool)
         self.assertIsInstance(truncated, bool)
@@ -1237,7 +1334,7 @@ class HoverEnvTests(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertEqual(info["episode_step"], 1)
         continued_observation, continued_info = env.continue_after_truncation()
-        self.assertEqual(continued_observation.shape, (13,))
+        self.assertEqual(continued_observation.shape, (14,))
         self.assertEqual(
             continued_info["episode_start_reason"],
             "time_limit_continuation",
@@ -1330,7 +1427,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, info = env.reset()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertTrue(info["episode_readiness"]["ready"])
         env.close()
 
@@ -1410,7 +1507,7 @@ class HoverEnvTests(unittest.TestCase):
         )
 
         self.assertTrue(started)
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(
             next_info["episode_start_reason"],
             "trainer_repositioned",
@@ -1426,7 +1523,6 @@ class HoverEnvTests(unittest.TestCase):
             host="127.0.0.1",
             port=18083,
             client_factory=lambda: client,
-            anchor_target_to_reset_state=False,
         )
         env.reset()
 
@@ -1454,7 +1550,7 @@ class HoverEnvTests(unittest.TestCase):
         env.step(np.asarray([0.0, 0.0, 0.5, 0.0], dtype=np.float32))
         observation, info = env.wait_for_next_episode()
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(info["episode_start_reason"], "trainer_reset")
         env.close()
 
@@ -1490,7 +1586,7 @@ class HoverEnvTests(unittest.TestCase):
         )
 
         self.assertTrue(started)
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(next_info["episode_start_reason"], "trainer_reset_button")
         env.close()
 
@@ -1515,7 +1611,6 @@ class HoverEnvTests(unittest.TestCase):
             host="127.0.0.1",
             port=18083,
             client_factory=lambda: client,
-            anchor_target_to_reset_state=False,
             reset_teleport_distance_m=2.0,
         )
         env.reset()
@@ -1596,7 +1691,6 @@ class HoverEnvTests(unittest.TestCase):
             host="127.0.0.1",
             port=18083,
             client_factory=lambda: client,
-            anchor_target_to_reset_state=False,
         )
         env.reset()
 
@@ -1610,7 +1704,7 @@ class HoverEnvTests(unittest.TestCase):
 
         observation, next_info = env.wait_for_next_episode(action=np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32))
 
-        self.assertEqual(observation.shape, (13,))
+        self.assertEqual(observation.shape, (14,))
         self.assertEqual(next_info["episode_start_reason"], "trainer_repositioned")
         env.close()
 

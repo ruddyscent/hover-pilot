@@ -13,23 +13,25 @@ REWARD_PROFILE_THROTTLE = "throttle"
 REWARD_PROFILE_ELEVATOR_THROTTLE = "elevator-throttle"
 REWARD_PROFILE_AILERON_THROTTLE = "aileron-throttle"
 REWARD_PROFILE_RUDDER_THROTTLE = "rudder-throttle"
-STANDARD_HOVER_INCLINATION_DEG = 0.0
-REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG = 90.0
+HOVER_TARGET_X_M = 1419.525024
+HOVER_TARGET_Y_M = -863.796143
+HOVER_TARGET_ALTITUDE_AGL_M = 2.0
+HOVER_TARGET_INCLINATION_DEG = 90.0
+HOVER_TARGET_GROUNDSPEED_MPS = 0.0
 
 
 @dataclass
 class RewardConfig:
     profile: str = REWARD_PROFILE_STANDARD
-    target_x_m: float = 0.0
-    target_y_m: float = 0.0
-    target_altitude_agl_m: float = 1.5
+    target_x_m: float = HOVER_TARGET_X_M
+    target_y_m: float = HOVER_TARGET_Y_M
+    target_altitude_agl_m: float = HOVER_TARGET_ALTITUDE_AGL_M
+    target_groundspeed_mps: float = HOVER_TARGET_GROUNDSPEED_MPS
     target_roll_deg: float = 0.0
     target_azimuth_deg: float = 0.0
     trainer_cylinder_radius_m: float = 6.0
     min_altitude_agl_m: float = 0.2
     position_error_weight: float = 0.15
-    altitude_error_weight: float = 0.2
-    attitude_error_weight: float = 0.01
     survival_reward: float = 1.0
     elevator_position_error_weight: float = 0.2
     elevator_altitude_error_weight: float = 0.1
@@ -37,6 +39,9 @@ class RewardConfig:
     elevator_recovery_position_gain_deg_per_m: float = 2.0
     elevator_recovery_velocity_gain_deg_per_mps: float = 3.0
     elevator_recovery_inclination_limit_deg: float = 30.0
+    rudder_recovery_position_gain_deg_per_m: float = 2.0
+    rudder_recovery_velocity_gain_deg_per_mps: float = 3.0
+    rudder_recovery_angle_limit_deg: float = 30.0
     pitch_rate_weight: float = 0.5
     velocity_error_weight: float = 0.2
     elevator_smoothness_weight: float = 0.01
@@ -106,6 +111,15 @@ class RewardConfig:
             "elevator_recovery_inclination_limit_deg": (
                 self.elevator_recovery_inclination_limit_deg
             ),
+            "rudder_recovery_position_gain_deg_per_m": (
+                self.rudder_recovery_position_gain_deg_per_m
+            ),
+            "rudder_recovery_velocity_gain_deg_per_mps": (
+                self.rudder_recovery_velocity_gain_deg_per_mps
+            ),
+            "rudder_recovery_angle_limit_deg": (
+                self.rudder_recovery_angle_limit_deg
+            ),
         }
         for name, value in recovery_parameters.items():
             if not math.isfinite(value) or value < 0.0:
@@ -168,6 +182,8 @@ class RewardBreakdown:
     terminal_penalty: float
     target_inclination_error_deg: float
     inclination_tracking_error_deg: float
+    target_rudder_angle_error_deg: float
+    rudder_tracking_error_deg: float
     terminated: bool
     termination_reason: Optional[str]
 
@@ -244,6 +260,8 @@ def compute_reward(
         episode_started=episode_started,
         ground_contact_duration_s=ground_contact_duration_s,
     )
+    target_rudder_angle_error_deg = 0.0
+    rudder_tracking_error_deg = 0.0
 
     if config.profile == REWARD_PROFILE_THROTTLE:
         features = (
@@ -288,6 +306,7 @@ def compute_reward(
                 state,
             )
         )
+        rudder_tracking_error_deg = rudder_state.rudder_angle_error_deg
         position_penalty = 0.0
         attitude_penalty = config.rudder_angle_error_weight * (
             _bounded_normalized_square(
@@ -494,28 +513,168 @@ def compute_reward(
     elif config.profile == REWARD_PROFILE_STANDARD:
         x_error = state.m_aircraftPositionX_MTR - config.target_x_m
         y_error = state.m_aircraftPositionY_MTR - config.target_y_m
-        altitude_error = (
-            state.m_altitudeAGL_MTR - config.target_altitude_agl_m
-        )
-        position_penalty = config.position_error_weight * (
-            (x_error * x_error) + (y_error * y_error)
-        )
-        altitude_penalty = config.altitude_error_weight * abs(altitude_error)
-        attitude_penalty = config.attitude_error_weight * (
-            abs(angular_error_deg(state.m_roll_DEG, config.target_roll_deg))
-            + abs(
-                angular_error_deg(
-                    state.m_inclination_DEG,
-                    STANDARD_HOVER_INCLINATION_DEG,
-                )
+        elevator_state = (
+            elevator_features
+            if elevator_features is not None
+            else compute_elevator_hover_features(
+                state,
+                target_x_m=config.target_x_m,
+                target_y_m=config.target_y_m,
+                target_altitude_agl_m=config.target_altitude_agl_m,
+                target_azimuth_deg=config.target_azimuth_deg,
             )
         )
-        angular_rate_penalty = 0.0
-        velocity_penalty = 0.0
-        action_smoothness_penalty = 0.0
-        survival_reward = 0.0
-        target_inclination_error_deg = 0.0
-        inclination_tracking_error_deg = 0.0
+        aileron_state = (
+            aileron_features
+            if aileron_features is not None
+            else compute_aileron_hover_features(
+                state,
+                target_roll_deg=config.target_roll_deg,
+            )
+        )
+        heading_rad = math.radians(config.target_azimuth_deg)
+        lateral_position_error_m = (
+            x_error * math.cos(heading_rad)
+            + y_error * math.sin(heading_rad)
+        )
+        lateral_velocity_mps = (
+            state.m_velocityWorldU_MPS * math.cos(heading_rad)
+            + state.m_velocityWorldV_MPS * math.sin(heading_rad)
+        )
+        rudder_state = (
+            rudder_features
+            if rudder_features is not None
+            else compute_rudder_hover_features(state)
+        )
+        target_rudder_angle_error_deg = (
+            compute_rudder_recovery_target_deg(
+                lateral_position_error_m,
+                lateral_velocity_mps,
+                position_gain_deg_per_m=(
+                    config.rudder_recovery_position_gain_deg_per_m
+                ),
+                velocity_gain_deg_per_mps=(
+                    config.rudder_recovery_velocity_gain_deg_per_mps
+                ),
+                angle_limit_deg=config.rudder_recovery_angle_limit_deg,
+            )
+        )
+        rudder_tracking_error_deg = angular_error_deg(
+            rudder_state.rudder_angle_error_deg,
+            target_rudder_angle_error_deg,
+        )
+        throttle_state = (
+            throttle_features
+            if throttle_features is not None
+            else compute_throttle_hover_features(
+                state,
+                target_altitude_agl_m=config.target_altitude_agl_m,
+            )
+        )
+        position_penalty = config.position_error_weight * (
+            _bounded_normalized_square(
+                x_error,
+                config.longitudinal_position_scale_m,
+                config.max_normalized_error_squared,
+            )
+            + _bounded_normalized_square(
+                y_error,
+                config.longitudinal_position_scale_m,
+                config.max_normalized_error_squared,
+            )
+        )
+        altitude_penalty = config.throttle_altitude_error_weight * (
+            _bounded_normalized_square(
+                throttle_state.altitude_error_m,
+                config.altitude_error_scale_m,
+                config.max_normalized_error_squared,
+            )
+        )
+        target_inclination_error_deg = (
+            compute_elevator_recovery_target_deg(
+                elevator_state.longitudinal_position_error_m,
+                elevator_state.longitudinal_velocity_mps,
+                position_gain_deg_per_m=(
+                    config.elevator_recovery_position_gain_deg_per_m
+                ),
+                velocity_gain_deg_per_mps=(
+                    config.elevator_recovery_velocity_gain_deg_per_mps
+                ),
+                inclination_limit_deg=(
+                    config.elevator_recovery_inclination_limit_deg
+                ),
+            )
+        )
+        inclination_tracking_error_deg = (
+            elevator_state.inclination_error_deg
+            - target_inclination_error_deg
+        )
+        attitude_penalty = (
+            config.inclination_error_weight
+            * _bounded_normalized_square(
+                inclination_tracking_error_deg,
+                config.inclination_error_scale_deg,
+                config.max_normalized_error_squared,
+            )
+            + config.aileron_roll_error_weight
+            * _bounded_normalized_square(
+                aileron_state.roll_error_deg,
+                config.roll_error_scale_deg,
+                config.max_normalized_error_squared,
+            )
+            + config.rudder_angle_error_weight
+            * _bounded_normalized_square(
+                rudder_tracking_error_deg,
+                config.rudder_angle_error_scale_deg,
+                config.max_normalized_error_squared,
+            )
+        )
+        angular_rate_penalty = (
+            config.pitch_rate_weight
+            * _bounded_normalized_square(
+                elevator_state.pitch_rate_deg_s,
+                config.pitch_rate_scale_deg_s,
+                config.max_normalized_error_squared,
+            )
+            + config.aileron_roll_rate_weight
+            * _bounded_normalized_square(
+                aileron_state.roll_rate_deg_s,
+                config.roll_rate_scale_deg_s,
+                config.max_normalized_error_squared,
+            )
+            + config.rudder_yaw_rate_weight
+            * _bounded_normalized_square(
+                rudder_state.yaw_rate_deg_s,
+                config.yaw_rate_scale_deg_s,
+                config.max_normalized_error_squared,
+            )
+        )
+        velocity_penalty = (
+            config.velocity_error_weight
+            * _bounded_normalized_square(
+                state.m_groundspeed_MPS
+                - config.target_groundspeed_mps,
+                config.velocity_error_scale_mps,
+                config.max_normalized_error_squared,
+            )
+            + config.throttle_vertical_velocity_weight
+            * _bounded_normalized_square(
+                throttle_state.vertical_velocity_mps,
+                config.velocity_error_scale_mps,
+                config.max_normalized_error_squared,
+            )
+        )
+        action_smoothness_penalty = (
+            config.elevator_smoothness_weight
+            * (elevator_delta / 2.0) ** 2
+            + config.aileron_smoothness_weight
+            * (aileron_delta / 2.0) ** 2
+            + config.rudder_smoothness_weight
+            * (rudder_delta / 2.0) ** 2
+            + config.throttle_smoothness_weight
+            * throttle_delta**2
+        )
+        survival_reward = config.survival_reward
     else:
         raise ValueError(f"unsupported reward profile: {config.profile!r}")
 
@@ -553,6 +712,8 @@ def compute_reward(
         terminal_penalty=terminal_penalty,
         target_inclination_error_deg=target_inclination_error_deg,
         inclination_tracking_error_deg=inclination_tracking_error_deg,
+        target_rudder_angle_error_deg=target_rudder_angle_error_deg,
+        rudder_tracking_error_deg=rudder_tracking_error_deg,
         terminated=termination.terminated,
         termination_reason=termination.termination_reason,
     )
@@ -582,7 +743,7 @@ def signed_vertical_inclination_error_deg(
         angular_error_deg(azimuth_deg, target_azimuth_deg)
     )
     return (
-        inclination_deg - REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG
+        inclination_deg - HOVER_TARGET_INCLINATION_DEG
     ) * math.cos(heading_error_rad)
 
 
@@ -710,6 +871,35 @@ def compute_elevator_recovery_target_deg(
     )
     limit = inclination_limit_deg
     return max(-limit, min(unconstrained_target, limit))
+
+
+def compute_rudder_recovery_target_deg(
+    lateral_position_error_m: float,
+    lateral_velocity_mps: float,
+    *,
+    position_gain_deg_per_m: float = 2.0,
+    velocity_gain_deg_per_mps: float = 3.0,
+    angle_limit_deg: float = 30.0,
+) -> float:
+    """Return the rudder tilt target that drives lateral drift to zero."""
+
+    parameters = (
+        position_gain_deg_per_m,
+        velocity_gain_deg_per_mps,
+        angle_limit_deg,
+    )
+    if any(not math.isfinite(value) or value < 0.0 for value in parameters):
+        raise ValueError(
+            "rudder recovery gains and limit must be finite and non-negative"
+        )
+    unconstrained_target = -(
+        position_gain_deg_per_m * lateral_position_error_m
+        + velocity_gain_deg_per_mps * lateral_velocity_mps
+    )
+    return max(
+        -angle_limit_deg,
+        min(unconstrained_target, angle_limit_deg),
+    )
 
 
 def _bounded_normalized_square(

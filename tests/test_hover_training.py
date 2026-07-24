@@ -3,9 +3,9 @@ import unittest
 from hoverpilot.rflink.models import FlightAxisState
 from hoverpilot.training.hover import (
     AileronHoverFeatures,
+    HOVER_TARGET_INCLINATION_DEG,
     REWARD_PROFILE_AILERON,
     REWARD_PROFILE_AILERON_THROTTLE,
-    REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
     REWARD_PROFILE_ELEVATOR,
     REWARD_PROFILE_RUDDER,
     REWARD_PROFILE_RUDDER_THROTTLE,
@@ -21,6 +21,7 @@ from hoverpilot.training.hover import (
     compute_elevator_recovery_target_deg,
     compute_reward,
     compute_rudder_hover_features,
+    compute_rudder_recovery_target_deg,
     compute_throttle_hover_features,
     compute_termination,
     project_onto_target_heading,
@@ -117,6 +118,8 @@ class HoverTrainingTests(unittest.TestCase):
 
     def test_altitude_does_not_reduce_cylinder_radius(self):
         config = RewardConfig(
+            target_x_m=0.0,
+            target_y_m=0.0,
             trainer_cylinder_radius_m=5.0,
             min_altitude_agl_m=-10.0,
             boundary_proximity_weight=1.0,
@@ -184,12 +187,20 @@ class HoverTrainingTests(unittest.TestCase):
     def test_touching_ground_only_terminates_after_episode_start(self):
         before_start = compute_termination(
             self._state(m_isTouchingGround=1.0),
-            RewardConfig(ground_contact_grace_seconds=0.0),
+            RewardConfig(
+                target_x_m=0.0,
+                target_y_m=0.0,
+                ground_contact_grace_seconds=0.0,
+            ),
             episode_started=False,
         )
         after_start = compute_termination(
             self._state(m_isTouchingGround=1.0),
-            RewardConfig(ground_contact_grace_seconds=0.0),
+            RewardConfig(
+                target_x_m=0.0,
+                target_y_m=0.0,
+                ground_contact_grace_seconds=0.0,
+            ),
             episode_started=True,
             ground_contact_duration_s=0.0,
         )
@@ -202,7 +213,11 @@ class HoverTrainingTests(unittest.TestCase):
         disabled = compute_termination(self._state(m_anEngineIsRunning=0.0), self.config)
         enabled = compute_termination(
             self._state(m_anEngineIsRunning=0.0),
-            RewardConfig(terminate_on_engine_stopped=True),
+            RewardConfig(
+                target_x_m=0.0,
+                target_y_m=0.0,
+                terminate_on_engine_stopped=True,
+            ),
         )
 
         self.assertFalse(disabled.terminated)
@@ -213,7 +228,11 @@ class HoverTrainingTests(unittest.TestCase):
         disabled = compute_termination(self._state(m_flightAxisControllerIsActive=0.0), self.config)
         enabled = compute_termination(
             self._state(m_flightAxisControllerIsActive=0.0),
-            RewardConfig(controller_active_threshold=0.5),
+            RewardConfig(
+                target_x_m=0.0,
+                target_y_m=0.0,
+                controller_active_threshold=0.5,
+            ),
         )
 
         self.assertFalse(disabled.terminated)
@@ -223,13 +242,29 @@ class HoverTrainingTests(unittest.TestCase):
     def test_elevator_reward_maps_vertical_realflight_attitude_to_zero_error(self):
         config = RewardConfig(
             profile=REWARD_PROFILE_ELEVATOR,
+            target_x_m=0.0,
+            target_y_m=0.0,
+            target_altitude_agl_m=1.0,
             boundary_proximity_weight=0.0,
         )
 
-        balanced = compute_reward(self._state(m_inclination_DEG=90.0), config)
-        tilted = compute_reward(self._state(m_inclination_DEG=112.5), config)
+        balanced = compute_reward(
+            self._state(
+                m_altitudeAGL_MTR=1.0,
+                m_inclination_DEG=90.0,
+            ),
+            config,
+        )
+        tilted = compute_reward(
+            self._state(
+                m_altitudeAGL_MTR=1.0,
+                m_inclination_DEG=112.5,
+            ),
+            config,
+        )
         rotating = compute_reward(
             self._state(
+                m_altitudeAGL_MTR=1.0,
                 m_inclination_DEG=90.0,
                 m_pitchRate_DEGpSEC=90.0,
             ),
@@ -243,6 +278,44 @@ class HoverTrainingTests(unittest.TestCase):
         self.assertAlmostEqual(rotating.angular_rate_penalty, 4.5)
         self.assertLess(tilted.reward, balanced.reward)
         self.assertLess(rotating.reward, balanced.reward)
+
+    def test_standard_reward_uses_vertical_inclination_reference(self):
+        config = RewardConfig(
+            target_x_m=0.0,
+            target_y_m=0.0,
+            target_altitude_agl_m=1.0,
+            boundary_proximity_weight=0.0,
+        )
+
+        vertical = compute_reward(
+            self._state(
+                m_altitudeAGL_MTR=1.0,
+                m_inclination_DEG=90.0,
+            ),
+            config,
+        )
+        horizontal = compute_reward(
+            self._state(
+                m_altitudeAGL_MTR=1.0,
+                m_inclination_DEG=0.0,
+            ),
+            config,
+        )
+        moving = compute_reward(
+            self._state(
+                m_altitudeAGL_MTR=1.0,
+                m_inclination_DEG=90.0,
+                m_groundspeed_MPS=5.0,
+            ),
+            config,
+        )
+
+        self.assertEqual(vertical.attitude_penalty, 0.0)
+        self.assertEqual(horizontal.attitude_penalty, 16.0)
+        self.assertEqual(vertical.velocity_penalty, 0.0)
+        self.assertAlmostEqual(moving.velocity_penalty, 0.2)
+        self.assertGreater(vertical.reward, horizontal.reward)
+        self.assertGreater(vertical.reward, moving.reward)
 
     def test_aileron_reward_penalizes_wrapped_roll_error_and_roll_rate(self):
         config = RewardConfig(
@@ -468,9 +541,62 @@ class HoverTrainingTests(unittest.TestCase):
             -30.0,
         )
 
+    def test_rudder_recovery_target_is_symmetric_and_bounded(self):
+        self.assertEqual(
+            compute_rudder_recovery_target_deg(4.0, 2.0),
+            -14.0,
+        )
+        self.assertEqual(
+            compute_rudder_recovery_target_deg(-4.0, -2.0),
+            14.0,
+        )
+        self.assertEqual(
+            compute_rudder_recovery_target_deg(10.0, 5.0),
+            -30.0,
+        )
+
+    def test_standard_reward_tracks_lateral_rudder_recovery_target(self):
+        config = RewardConfig(
+            target_x_m=0.0,
+            target_y_m=0.0,
+            target_azimuth_deg=0.0,
+            boundary_proximity_weight=0.0,
+        )
+        shared_features = {
+            "elevator_features": ElevatorHoverFeatures(
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            ),
+            "aileron_features": AileronHoverFeatures(0.0, 0.0),
+            "throttle_features": ThrottleHoverFeatures(0.0, 0.0),
+        }
+        tracking = compute_reward(
+            self._state(
+                m_aircraftPositionX_MTR=4.0,
+                m_velocityWorldU_MPS=2.0,
+            ),
+            config,
+            rudder_features=RudderHoverFeatures(-14.0, 0.0),
+            **shared_features,
+        )
+        vertical = compute_reward(
+            self._state(
+                m_aircraftPositionX_MTR=4.0,
+                m_velocityWorldU_MPS=2.0,
+            ),
+            config,
+            rudder_features=RudderHoverFeatures(0.0, 0.0),
+            **shared_features,
+        )
+
+        self.assertEqual(tracking.target_rudder_angle_error_deg, -14.0)
+        self.assertEqual(tracking.rudder_tracking_error_deg, 0.0)
+        self.assertLess(tracking.attitude_penalty, vertical.attitude_penalty)
+
     def test_elevator_reward_prefers_opposite_tilt_during_drift(self):
         config = RewardConfig(
             profile=REWARD_PROFILE_ELEVATOR,
+            target_x_m=0.0,
+            target_y_m=0.0,
             boundary_proximity_weight=0.0,
         )
         vertical = compute_reward(
@@ -502,7 +628,7 @@ class HoverTrainingTests(unittest.TestCase):
 
         features = compute_elevator_hover_features(
             self._state(
-                m_inclination_DEG=REALFLIGHT_VERTICAL_HOVER_INCLINATION_DEG,
+                m_inclination_DEG=HOVER_TARGET_INCLINATION_DEG,
                 m_azimuth_DEG=215.0,
             ),
             target_x_m=0.0,
@@ -516,6 +642,8 @@ class HoverTrainingTests(unittest.TestCase):
     def test_elevator_reward_penalizes_longitudinal_not_lateral_error(self):
         config = RewardConfig(
             profile=REWARD_PROFILE_ELEVATOR,
+            target_x_m=0.0,
+            target_y_m=0.0,
             target_azimuth_deg=90.0,
             boundary_proximity_weight=0.0,
         )

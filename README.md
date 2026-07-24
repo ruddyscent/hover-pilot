@@ -62,12 +62,16 @@ Action format is a 4-element `float32` array:
 - index 2: `throttle` in `[0, 1]`
 - index 3: `rudder` in `[-1, 1]`
 
-Observation format is a normalized 13-element `float32` vector for hover training:
+The default all-controls task uses a normalized 14-element `float32` vector
+built from the control-axis observations that are also used by the individual
+trainer modes:
 
-- target-relative position: scaled `x_error`, `y_error`, `altitude_error`
-- attitude: scaled `roll`, scaled `inclination`, `sin(azimuth)`, `cos(azimuth)`
-- scaled world velocity: `u`, `v`, `w`
-- scaled angular rates: `pitch_rate`, `roll_rate`, `yaw_rate`
+- integrated body roll error and roll rate for aileron
+- inclination tracking error, pitch rate, longitudinal position and velocity,
+  altitude error, and vertical velocity for elevator
+- altitude error and up-positive vertical velocity for throttle
+- lateral-recovery tracking error and yaw rate for rudder
+- lateral position error and velocity for value estimation
 
 Elevator-only PPO uses a compact 6-element longitudinal observation instead:
 
@@ -86,7 +90,8 @@ bounds without breaking the PPO log-probability ratio. Throttle is mapped to
 
 Reward and termination are integrated from `hoverpilot.training.hover`:
 
-- reward prefers staying near the target hover point and upright attitude
+- reward prefers staying near the target hover point with vertical attitude
+  and zero groundspeed
 - boundary proximity adds a growing penalty before failure
 - terminal failures include trainer cylinder exit, minimum-altitude failure, lost components, locked vehicle states, configured controller inactivity, configured engine stop, and post-start ground contact
 
@@ -313,6 +318,23 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
+The all-controls actor combines the independently validated structured
+aileron, elevator, throttle, and rudder policies. Elevator drives longitudinal
+position back to the origin; rudder performs the equivalent lateral recovery.
+Aileron uses integrated body roll rate instead of RealFlight's Euler roll,
+which becomes discontinuous around the vertical-hover singularity. Throttle
+uses a learned hover trim and AGL feedback. Each 300-step time limit starts a
+new rollout segment without resetting the live aircraft, so long-duration
+drift remains visible to training and evaluation.
+
+All control modes use the same fixed RealFlight world target:
+`X=1419.525024 m`, `Y=-863.796143 m`, `AGL=2 m`, and
+`inclination=90°`, with `groundspeed=0 m/s`. Starting or reconnecting an
+episode never replaces the position, altitude, attitude, or groundspeed target
+with the current aircraft state. Mode-specific roll, heading, and integrated
+rudder references remain episode-relative where required by their control
+geometry.
+
 For an Airplane Hover Trainer configuration where only aileron is enabled,
 use the one-dimensional aileron mode:
 
@@ -375,7 +397,7 @@ uv run hoverpilot-ppo train --control-mode throttle \
   --seed 42
 ```
 
-Throttle mode keeps the AGL target fixed at `1.5 m` across episode reconnects.
+Throttle mode keeps the AGL target fixed at `2 m` across episode reconnects.
 It observes only target-relative AGL error and vertical velocity; RealFlight's
 down-positive world-W velocity is converted to an up-positive value. The
 reward penalizes squared normalized altitude error, vertical velocity, and
@@ -411,9 +433,9 @@ contains only roll, roll-rate, altitude, vertical-velocity, and enabled-action
 smoothness terms.
 
 Because this trainer configuration has no normal collision/reset boundary,
-each 300-step limit closes and reconnects RFLink. The initial roll and AGL
-targets survive deliberate reconnects so drift is not hidden; an actual
-trainer reposition establishes new targets.
+each 300-step limit closes and reconnects RFLink. The roll reference survives
+deliberate reconnects and an actual trainer reposition establishes a new roll
+reference. The world position and `AGL=2 m` targets remain fixed.
 
 For an Airplane Hover Trainer configuration where only rudder and throttle
 are enabled, use the two-dimensional combined mode:
@@ -434,9 +456,9 @@ remain neutral. The reward contains only rudder-angle, yaw-rate, altitude,
 vertical-velocity, and enabled-action smoothness terms.
 
 Each 300-step limit deliberately closes and reconnects RFLink. The integrated
-rudder angle is reset to zero for the new episode, while the original AGL
-target survives the reconnect so height drift is not hidden. An actual trainer
-reposition establishes a new AGL target.
+rudder angle is reset to zero for the new episode, while the world position
+and `AGL=2 m` targets remain fixed through both reconnects and trainer
+repositions.
 
 For an Airplane Hover Trainer configuration where only elevator and throttle
 are enabled, use the two-dimensional combined mode:
@@ -456,10 +478,9 @@ throttle uses AGL error, vertical velocity, and a learned hover trim. Aileron
 and rudder remain neutral. The reward retains elevator position, attitude,
 rate, altitude, and velocity terms and adds throttle smoothness.
 
-Every 300-step time limit closes and reconnects RFLink. The initial local
-position, heading, and AGL target survive these deliberate reconnects so that
-drift is not hidden, but an actual trainer reposition establishes a new local
-target.
+Every 300-step time limit closes and reconnects RFLink. The heading reference
+survives deliberate reconnects and an actual trainer reposition establishes a
+new heading reference. The world position and `AGL=2 m` targets remain fixed.
 
 For a RealFlight Hover Trainer configuration where PPO controls only elevator,
 use a one-dimensional policy and keep the other transmitted channels fixed:
@@ -496,7 +517,8 @@ attitude. Elevator mode converts that to a signed control error of `0°`.
 Because azimuth flips by 180° at this Euler singularity, the signed error is
 computed as `(inclination - 90°) * cos(azimuth - reset heading)`. This lets the
 policy distinguish equal tilts on opposite sides of vertical. Position,
-altitude, and heading are anchored at each trainer reset. Position and
+altitude, and inclination use the fixed world target; only heading is anchored
+at each trainer reset. Position and
 longitudinal position rate command a signed target inclination, limited to
 `30°`; at the origin the target remains the vertical `0°` error. The position
 rate is calculated directly from consecutive positions and RealFlight physics
@@ -524,14 +546,16 @@ the rollout on-policy. `--policy-preset none` is the default; the optional
 PPO learns a bounded residual. Compare both presets when the goal is to
 distinguish learned PPO performance from controller assistance.
 
-Each trainer reposition defines a new local three-dimensional origin. The reset
-position is `(x=0, y=0, z=0)`, where `z` is altitude AGL relative to the reset
-altitude. The trainer boundary is modeled as a vertical cylinder with a 6 m
-horizontal radius around the reset x/y position. Altitude does not reduce the
-available horizontal radius, and no unverified upper ceiling is imposed. A new
-process also requires the aircraft to be within 0.5° of the vertical attitude
-before accepting a state as an episode start, so an in-progress fall is not
-re-anchored as a new origin.
+The training coordinate origin is fixed at RealFlight world
+`X=1419.525024 m`, `Y=-863.796143 m`, and `AGL=2 m`; the vertical attitude
+origin is `inclination=90°`, and the velocity origin is
+`groundspeed=0 m/s`. Trainer repositions do not move these references. The
+trainer boundary is modeled as a vertical cylinder with a 6 m horizontal
+radius around the fixed X/Y origin. Altitude does not reduce the available
+horizontal radius, and no unverified upper ceiling is imposed. A new process
+also requires the aircraft to be within 0.5° of the vertical attitude before
+accepting a state as an episode start, so an in-progress fall cannot begin a
+new episode.
 
 Continue training a structured elevator checkpoint with:
 

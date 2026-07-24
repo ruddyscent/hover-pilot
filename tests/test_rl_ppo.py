@@ -90,7 +90,7 @@ class PlayEnv(gym.Env if gym is not None else object):
         self.observation_space = gym.spaces.Box(
             low=-5.0,
             high=5.0,
-            shape=(13,),
+            shape=(14,),
             dtype=np.float32,
         )
         self.action_space = gym.spaces.Box(
@@ -161,12 +161,12 @@ class PPOTrainingModuleTests(unittest.TestCase):
         low = np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32)
         high = np.ones(4, dtype=np.float32)
         model = ActorCritic(
-            13,
+            14,
             low,
             high,
             control_mode=CONTROL_MODE_ALL,
         )
-        observation = torch.zeros((64, 13), dtype=torch.float32)
+        observation = torch.zeros((64, 14), dtype=torch.float32)
 
         action, old_log_prob, _ = model.get_action(observation)
         new_log_prob, _, _, _ = model.evaluate_actions(observation, action)
@@ -201,18 +201,61 @@ class PPOTrainingModuleTests(unittest.TestCase):
         low = np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32)
         high = np.ones(4, dtype=np.float32)
         model = ActorCritic(
-            13,
+            14,
             low,
             high,
             control_mode=CONTROL_MODE_ALL,
         )
 
-        action = model.deterministic_action(torch.zeros((1, 13), dtype=torch.float32))
+        action = model.deterministic_action(torch.zeros((1, 14), dtype=torch.float32))
 
         np.testing.assert_allclose(
             action.detach().numpy()[0],
-            np.asarray([0.0, 0.0, 0.55, 0.0], dtype=np.float32),
+            np.asarray([0.78, 0.0, 0.65, 0.0], dtype=np.float32),
             atol=1.0e-5,
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_all_controls_policy_combines_axis_restoring_controllers(self):
+        model = ActorCritic(
+            14,
+            np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+            control_mode=CONTROL_MODE_ALL,
+        )
+        actions = model.deterministic_action(
+            torch.eye(14, dtype=torch.float32)
+        ).detach()
+        trim = model.deterministic_action(
+            torch.zeros((1, 14), dtype=torch.float32)
+        ).detach()[0]
+
+        self.assertEqual(tuple(actions.shape), (14, 4))
+        self.assertLess(float(actions[0, 0]), float(trim[0]))
+        self.assertLess(float(actions[1, 0]), float(trim[0]))
+        self.assertLess(float(actions[2, 1]), 0.0)
+        self.assertGreater(float(actions[3, 1]), 0.0)
+        self.assertLess(float(actions[8, 2]), float(trim[2]))
+        self.assertLess(float(actions[9, 2]), float(trim[2]))
+        self.assertGreater(float(actions[10, 3]), 0.0)
+        self.assertGreater(float(actions[11, 3]), 0.0)
+        np.testing.assert_allclose(
+            trim.numpy(),
+            [0.78, 0.0, 0.65, 0.0],
+            atol=1.0e-5,
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_all_controls_initial_action_uses_validated_trims(self):
+        action = _initial_env_action(
+            CONTROL_MODE_ALL,
+            0.2,
+            (0.0, 0.0, 0.55, 0.0),
+        )
+
+        np.testing.assert_allclose(
+            action,
+            [0.78, 0.0, 0.65, 0.0],
         )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
@@ -1086,8 +1129,8 @@ class PPOTrainingModuleTests(unittest.TestCase):
         )
 
         self.assertEqual(standard.config.timesteps, 50_000)
-        self.assertEqual(standard.config.learning_rate, 3e-4)
-        self.assertEqual(standard.config.eval_episodes, 3)
+        self.assertEqual(standard.config.learning_rate, 1e-4)
+        self.assertEqual(standard.config.eval_episodes, 10)
         self.assertEqual(elevator.config.timesteps, 300_000)
         self.assertEqual(elevator.config.learning_rate, 1e-4)
         self.assertEqual(elevator.config.eval_episodes, 10)
@@ -1413,7 +1456,14 @@ class PPOTrainingModuleTests(unittest.TestCase):
             )
             self.assertEqual(saved_checkpoint["checkpoint_format"], PPO_CHECKPOINT_FORMAT)
             self.assertEqual(saved_checkpoint["format_version"], PPO_CHECKPOINT_VERSION)
-            self.assertIn("policy_mean.weight", saved_checkpoint["model_state_dict"])
+            self.assertIn(
+                "aileron_policy_raw_gain",
+                saved_checkpoint["model_state_dict"],
+            )
+            self.assertIn(
+                "throttle_policy_trim_latent",
+                saved_checkpoint["model_state_dict"],
+            )
             self.assertIn("policy_prior_weight", saved_checkpoint["model_state_dict"])
             self.assertIn("_policy_prior_limit", saved_checkpoint["model_state_dict"])
             self.assertIn("_policy_residual_limit", saved_checkpoint["model_state_dict"])
@@ -1552,7 +1602,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 self.observation_space = gym.spaces.Box(
                     low=-1.0,
                     high=1.0,
-                    shape=(13,),
+                    shape=(14,),
                     dtype=np.float32,
                 )
                 self.action_space = gym.spaces.Box(
@@ -1565,7 +1615,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             def reset(self, *, seed=None, options=None):
                 del seed, options
                 self.steps = 0
-                return np.zeros(13, dtype=np.float32), {
+                return np.zeros(14, dtype=np.float32), {
                     "episode_start_reason": "test_reset",
                     "waiting_for_reset": False,
                 }
@@ -1574,7 +1624,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 self.steps += 1
                 terminated = self.steps == 3
                 info = {"termination_reason": "test_end" if terminated else None}
-                return np.zeros(13, dtype=np.float32), 1.0, terminated, False, info
+                return np.zeros(14, dtype=np.float32), 1.0, terminated, False, info
 
         class TestTrainer(PPOTrainer):
             def __init__(self, config):
@@ -1693,7 +1743,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 self.observation_space = gym.spaces.Box(
                     low=-1.0,
                     high=1.0,
-                    shape=(13,),
+                    shape=(14,),
                     dtype=np.float32,
                 )
                 self.action_space = gym.spaces.Box(
@@ -1706,7 +1756,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
 
             def reset(self, *, seed=None, options=None):
                 del seed, options
-                return np.zeros(13, dtype=np.float32), {
+                return np.zeros(14, dtype=np.float32), {
                     "episode_start_reason": "test_reset",
                     "waiting_for_reset": False,
                 }
@@ -1716,7 +1766,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 self.steps += 1
                 if self.steps == 2:
                     raise TimeoutError("simulated RFLink timeout")
-                return np.zeros(13, dtype=np.float32), 1.0, False, False, {
+                return np.zeros(14, dtype=np.float32), 1.0, False, False, {
                     "termination_reason": None
                 }
 
