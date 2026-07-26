@@ -676,8 +676,6 @@ episode time limit with decreasing inclination and pitch-rate errors.
 
 If this project has been helpful, you can support my work.
 
-🌍 International
-
 - PayPal: https://paypal.me/kyungwonchun
 
 ## License
