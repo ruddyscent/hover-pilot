@@ -611,8 +611,10 @@ uv run hoverpilot-ppo play --checkpoint ppo_hoverpilot.pt
 
 `play` loads the checkpoint, runs deterministic policy inference, and sends the
 resulting aileron, elevator, throttle, and rudder commands through RealFlight
-Link. It continues across trainer resets until you press `Ctrl+C`. To run a fixed
-number of episodes instead:
+Link. Without `--max-episode-steps`, each episode continues until the aircraft
+hits a simulator termination condition such as a collision or trainer-boundary
+exit. The command continues across trainer resets until you press `Ctrl+C`. To
+run a fixed number of episodes instead:
 
 ```bash
 uv run hoverpilot-ppo play \

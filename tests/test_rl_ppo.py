@@ -1360,7 +1360,22 @@ class PPOTrainingModuleTests(unittest.TestCase):
 
         self.assertEqual(args.checkpoint, "policy.pt")
         self.assertEqual(args.episodes, 0)
+        self.assertIsNone(args.max_episode_steps)
         self.assertEqual(args.device, "auto")
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_play_cli_accepts_explicit_episode_step_limit(self):
+        args = parse_args(
+            [
+                "play",
+                "--checkpoint",
+                "policy.pt",
+                "--max-episode-steps",
+                "600",
+            ]
+        )
+
+        self.assertEqual(args.max_episode_steps, 600)
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_diagnose_elevator_cli_uses_conservative_pulse_defaults(self):

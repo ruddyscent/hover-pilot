@@ -202,7 +202,7 @@ class PPOPlayConfig:
     checkpoint_path: str
     host: str = HOST
     port: int = PORT
-    max_episode_steps: Optional[int] = 300
+    max_episode_steps: Optional[int] = None
     sleep_interval_s: float = 0.0
     device: str = "auto"
     episodes: int = 0
@@ -3742,7 +3742,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         default=0,
         help="Number of episodes to run; 0 runs until interrupted.",
     )
-    play_parser.add_argument("--max-episode-steps", type=int, default=300)
+    play_parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help=(
+            "Maximum control steps per episode. When omitted, an episode "
+            "continues until a simulator termination condition is reached."
+        ),
+    )
     play_parser.add_argument("--sleep-interval-s", type=float, default=0.0)
     play_parser.add_argument(
         "--log-interval-steps",
