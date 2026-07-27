@@ -41,7 +41,12 @@ from hoverpilot.envs import (
 )
 from hoverpilot.rl.elevator_diagnostics import diagnose_elevator_response
 from hoverpilot.rflink.client import RFLinkClient
-from hoverpilot.training.hover import ElevatorHoverFeatures, RewardConfig, angular_error_deg
+from hoverpilot.training.hover import (
+    HOVER_TARGET_INCLINATION_DEG,
+    ElevatorHoverFeatures,
+    RewardConfig,
+    angular_error_deg,
+)
 from hoverpilot.utils.logger import format_debug_state
 
 
@@ -100,6 +105,7 @@ _THROTTLE_PPO_INITIAL_GAIN = np.asarray(
     [1.50, 2.00],
     dtype=np.float32,
 )
+_ALL_CONTROLS_RESIDUAL_SCALE = 0.2
 _THROTTLE_PPO_INITIAL_TRIM = 0.65
 _ELEVATOR_PD_PRIOR_LIMIT = 0.5
 _ELEVATOR_PD_RESIDUAL_LIMIT = 0.2
@@ -145,8 +151,6 @@ DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_EVAL_EPISODES = 10
 DEFAULT_ENTROPY_COEF = 0.0001
 DEFAULT_POLICY_STD = 0.08
-
-
 @dataclass
 class PPOConfig:
     host: str = HOST
@@ -182,6 +186,11 @@ class PPOConfig:
     control_mode: str = CONTROL_MODE_ALL
     policy_preset: str = POLICY_PRESET_NONE
     elevator_fixed_throttle: float = 0.55
+    episode_start_idle_seconds: float = 0.0
+    episode_start_idle_throttle: float = 0.66
+    episode_start_idle_curriculum_steps: int = 0
+    episode_start_idle_curriculum_start_seconds: float = 0.0
+    episode_start_handoff_seconds: float = 0.1
     rflink_socket_timeout_s: float = 3.0
     rflink_request_attempts: int = 4
     rflink_retry_backoff_s: float = 0.1
@@ -539,7 +548,7 @@ class ActorCritic(nn.Module):
                 or use_linear_aileron_policy
                 or use_linear_rudder_policy
                 or use_linear_throttle_policy
-            )
+            ) and not enforce_all_controls_structure
             else nn.Linear(hidden_sizes[-1], action_dim)
         )
         self.policy_log_std = nn.Parameter(torch.zeros(action_dim, dtype=torch.float32))
@@ -550,12 +559,19 @@ class ActorCritic(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=math.sqrt(2.0))
                     module.bias.zero_()
             if self.policy_mean is not None:
-                nn.init.orthogonal_(self.policy_mean.weight, gain=0.01)
+                if enforce_all_controls_structure:
+                    self.policy_mean.weight.zero_()
+                else:
+                    nn.init.orthogonal_(self.policy_mean.weight, gain=0.01)
                 self.policy_mean.bias.zero_()
             nn.init.orthogonal_(self.value_head.weight, gain=1.0)
             self.value_head.bias.zero_()
             self.policy_log_std.fill_(math.log(initial_policy_std))
-            if action_dim >= 3 and self.policy_mean is not None:
+            if (
+                action_dim >= 3
+                and self.policy_mean is not None
+                and not enforce_all_controls_structure
+            ):
                 # Hover training needs non-zero throttle from the first step.
                 normalized_throttle = 2.0 * float(DEFAULT_INITIAL_ACTION[2]) - 1.0
                 self.policy_mean.bias[2] = math.atanh(normalized_throttle)
@@ -647,7 +663,7 @@ class ActorCritic(nn.Module):
                 rudder_gain[0] * obs[..., 10:11]
                 + rudder_gain[1] * obs[..., 11:12]
             )
-            return torch.cat(
+            structured_mean = torch.cat(
                 (
                     aileron_mean,
                     elevator_mean,
@@ -656,6 +672,14 @@ class ActorCritic(nn.Module):
                 ),
                 dim=-1,
             )
+            assert self.policy_mean is not None
+            if hidden is None:
+                hidden = self.shared(obs)
+            residual = (
+                _ALL_CONTROLS_RESIDUAL_SCALE
+                * self.policy_mean(hidden)
+            )
+            return structured_mean + residual
         if elevator_gain is not None and throttle_gain is not None:
             assert self.throttle_policy_trim_latent is not None
             elevator_mean = (
@@ -1250,6 +1274,40 @@ class PPOTrainer:
             raise ValueError("checkpoint_interval_steps must be non-negative")
         if config.telemetry_log_interval_steps < 0:
             raise ValueError("telemetry_log_interval_steps must be non-negative")
+        if (
+            not math.isfinite(config.episode_start_idle_seconds)
+            or config.episode_start_idle_seconds < 0.0
+        ):
+            raise ValueError(
+                "episode_start_idle_seconds must be a finite non-negative value"
+            )
+        if config.episode_start_idle_curriculum_steps < 0:
+            raise ValueError(
+                "episode_start_idle_curriculum_steps must be non-negative"
+            )
+        if (
+            not math.isfinite(
+                config.episode_start_idle_curriculum_start_seconds
+            )
+            or config.episode_start_idle_curriculum_start_seconds < 0.0
+            or config.episode_start_idle_curriculum_start_seconds
+            > config.episode_start_idle_seconds
+        ):
+            raise ValueError(
+                "episode_start_idle_curriculum_start_seconds must be finite "
+                "and between zero and episode_start_idle_seconds"
+            )
+        if (
+            not math.isfinite(config.episode_start_handoff_seconds)
+            or config.episode_start_handoff_seconds < 0.0
+        ):
+            raise ValueError(
+                "episode_start_handoff_seconds must be a finite non-negative value"
+            )
+        _validate_fixed_throttle(
+            config.episode_start_idle_throttle,
+            "episode start idle",
+        )
         resume_checkpoint = (
             load_policy_checkpoint(config.resume_from)
             if config.resume_from is not None
@@ -1263,6 +1321,7 @@ class PPOTrainer:
                     resume_checkpoint.observation_config,
                 ),
             )
+        if resume_checkpoint is not None:
             if resume_checkpoint.control_mode != config.control_mode:
                 raise ValueError(
                     "Resume checkpoint uses control mode "
@@ -1312,8 +1371,19 @@ class PPOTrainer:
         ).to(self.device)
         if resume_checkpoint is not None:
             self._load_resume_checkpoint(resume_checkpoint, config.resume_from)
+            if config.policy_initial_std is not None:
+                with torch.no_grad():
+                    self.model.policy_log_std.fill_(
+                        math.log(config.policy_initial_std)
+                    )
+                print(
+                    "[PPO] Overrode resumed policy exploration std with "
+                    f"{config.policy_initial_std}"
+                )
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
         self.writer = self._build_writer()
+        self._curriculum_exposure_steps = 0
+        self._evaluating = False
 
     def _load_resume_checkpoint(
         self,
@@ -1321,9 +1391,22 @@ class PPOTrainer:
         checkpoint_path: str,
     ):
         try:
-            self.model.load_state_dict(checkpoint.model_state_dict, strict=True)
+            incompatible = self.model.load_state_dict(
+                checkpoint.model_state_dict,
+                strict=False,
+            )
         except RuntimeError as exc:
             raise ValueError(f"Resume checkpoint is incompatible: {exc}") from exc
+        allowed_missing = {"policy_mean.weight", "policy_mean.bias"}
+        if (
+            set(incompatible.missing_keys) - allowed_missing
+            or incompatible.unexpected_keys
+        ):
+            raise ValueError(
+                "Resume checkpoint is incompatible: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
         print(
             f"[PPO] Resumed policy weights from {checkpoint_path} "
             f"policy_preset={self.policy_preset}"
@@ -1355,6 +1438,176 @@ class PPOTrainer:
             self.config.control_mode,
             self.elevator_fixed_throttle,
             self.config.initial_action,
+        )
+
+    def _episode_start_idle_action(self) -> np.ndarray:
+        return np.asarray(
+            [0.0, 0.0, self.config.episode_start_idle_throttle, 0.0],
+            dtype=np.float32,
+        )
+
+    def _episode_start_idle_duration_s(self) -> float:
+        if self._evaluating or self.config.episode_start_idle_curriculum_steps == 0:
+            return self.config.episode_start_idle_seconds
+        progress = min(
+            1.0,
+            self._curriculum_exposure_steps
+            / self.config.episode_start_idle_curriculum_steps,
+        )
+        start_seconds = (
+            self.config.episode_start_idle_curriculum_start_seconds
+        )
+        return start_seconds + (
+            self.config.episode_start_idle_seconds - start_seconds
+        ) * progress
+
+    def _deterministic_env_action(self, observation: np.ndarray) -> np.ndarray:
+        observation_tensor = torch.as_tensor(
+            observation,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+        with torch.no_grad():
+            policy_action = self.model.deterministic_action(
+                observation_tensor
+            ).squeeze(0)
+        normalized_action = self._normalize_action(
+            policy_action.cpu().numpy()
+        )
+        return self._to_env_action(normalized_action)
+
+    def _apply_episode_start_idle(
+        self,
+        observation: np.ndarray,
+        info: dict[str, object],
+    ) -> Optional[Tuple[np.ndarray, dict[str, object]]]:
+        idle_duration_s = self._episode_start_idle_duration_s()
+        if idle_duration_s == 0.0:
+            return observation, info
+        run_idle = getattr(self.env, "run_episode_start_idle", None)
+        if not callable(run_idle):
+            raise RuntimeError(
+                "environment does not support an episode start idle period"
+            )
+        started, observation, info = run_idle(
+            duration_s=idle_duration_s,
+            action=self._episode_start_idle_action(),
+        )
+        if not started:
+            details = info.get("episode_start_idle", {})
+            print(
+                "[PPO] episode start idle ended before policy handoff "
+                f"reason={info.get('termination_reason')} details={details}"
+            )
+            return None
+
+        idle_details = info.get("episode_start_idle", {})
+        if self.config.episode_start_handoff_seconds == 0.0:
+            return observation, info
+        handoff_duration_s = self.config.episode_start_handoff_seconds
+        run_handoff = getattr(self.env, "run_episode_start_handoff", None)
+        if not callable(run_handoff):
+            raise RuntimeError(
+                "environment does not support an episode start handoff"
+            )
+        started, observation, info = run_handoff(
+            duration_s=handoff_duration_s,
+            start_action=self._episode_start_idle_action(),
+            action_provider=self._deterministic_env_action,
+        )
+        info["episode_start_idle"] = idle_details
+        if started:
+            return observation, info
+        details = info.get("episode_start_handoff", {})
+        print(
+            "[PPO] episode start handoff ended before policy control "
+            f"reason={info.get('termination_reason')} details={details}"
+        )
+        return None
+
+    def _reset_episode(
+        self,
+        *,
+        require_reset_boundary: bool = False,
+    ) -> Tuple[np.ndarray, dict[str, object]]:
+        require_reset_boundary = (
+            require_reset_boundary
+            or self.config.episode_start_idle_seconds > 0.0
+        )
+        while True:
+            observation, info = reset_env_with_wait(
+                self.env,
+                action=self._wait_action(),
+                initial_action=self._initial_action(),
+                require_reset_boundary=require_reset_boundary,
+            )
+            prepared = self._apply_episode_start_idle(observation, info)
+            if prepared is not None:
+                return prepared
+
+    def _continue_episode(self) -> Tuple[np.ndarray, dict[str, object]]:
+        observation, info = continue_env_after_truncation(self.env)
+        prepared = self._apply_episode_start_idle(observation, info)
+        if prepared is not None:
+            return prepared
+        return self._reset_episode()
+
+    def _start_after_truncation(
+        self,
+    ) -> Tuple[np.ndarray, dict[str, object]]:
+        if (
+            self.config.control_mode in CONNECTION_EPISODE_CONTROL_MODES
+            or self.config.episode_start_idle_seconds > 0.0
+        ):
+            return self._reset_episode(require_reset_boundary=True)
+        return self._continue_episode()
+
+    def _advance_episode_start_idle_curriculum(
+        self,
+        successful_steps: int,
+    ) -> None:
+        if (
+            self._evaluating
+            or self.config.episode_start_idle_curriculum_steps == 0
+        ):
+            return
+        self._curriculum_exposure_steps += successful_steps
+
+    def _episode_qualifies_for_curriculum_progress(
+        self,
+        info: Mapping[str, object],
+    ) -> bool:
+        debug_state = info.get("debug_state")
+        if not isinstance(debug_state, Mapping):
+            return False
+        try:
+            radial_distance_m = float(
+                debug_state["distance_from_cylinder_axis_m"]
+            )
+            horizontal_speed_mps = math.hypot(
+                float(debug_state["velocity_world_u_mps"]),
+                float(debug_state["velocity_world_v_mps"]),
+            )
+            altitude_error_m = abs(
+                float(debug_state["altitude_agl_m"])
+                - self.env.reward_config.target_altitude_agl_m
+            )
+            tilt_error_deg = abs(
+                float(debug_state["inclination_deg"])
+                - HOVER_TARGET_INCLINATION_DEG
+            )
+        except (KeyError, TypeError, ValueError):
+            return False
+        reward_config = self.env.reward_config
+        return (
+            radial_distance_m
+            <= reward_config.trainer_cylinder_radius_m / 3.0
+            and horizontal_speed_mps
+            <= reward_config.velocity_error_scale_mps * 0.3
+            and altitude_error_m
+            <= reward_config.altitude_error_scale_m / 3.0
+            and tilt_error_deg
+            <= reward_config.inclination_error_scale_deg
         )
 
     def _policy_action_labels(self) -> tuple[str, ...]:
@@ -1822,10 +2075,42 @@ class PPOTrainer:
 
     def _log_episode_start(self, info: dict[str, object]):
         debug_state = info.get("debug_state") if isinstance(info, dict) else None
+        episode_start_idle = (
+            info.get("episode_start_idle") if isinstance(info, dict) else None
+        )
+        episode_start_handoff = (
+            info.get("episode_start_handoff")
+            if isinstance(info, dict)
+            else None
+        )
         print(
             f"[PPO] episode start reason={info.get('episode_start_reason')} "
             f"waiting={info.get('waiting_for_reset')}"
         )
+        if isinstance(episode_start_idle, dict):
+            print(
+                "[PPO] episode start idle "
+                f"duration={float(episode_start_idle.get('elapsed_physics_s', 0.0)):.2f}s "
+                f"steps={int(episode_start_idle.get('hold_steps', 0))} "
+                f"throttle={float(episode_start_idle.get('throttle', 0.0)):.2f} "
+                f"tilt={float(episode_start_idle.get('initial_tilt_deg', 0.0)):.1f}"
+                "->"
+                f"{float(episode_start_idle.get('control_start_tilt_deg', 0.0)):.1f}deg "
+                f"altitude={float(episode_start_idle.get('initial_altitude_agl_m', 0.0)):.2f}"
+                "->"
+                f"{float(episode_start_idle.get('control_start_altitude_agl_m', 0.0)):.2f}m"
+            )
+        if isinstance(episode_start_handoff, dict):
+            print(
+                "[PPO] episode start handoff "
+                f"duration={float(episode_start_handoff.get('elapsed_physics_s', 0.0)):.2f}s "
+                f"steps={int(episode_start_handoff.get('handoff_steps', 0))} "
+                f"max_delta={float(episode_start_handoff.get('max_action_delta', 0.0)):.3f} "
+                f"max_step={float(episode_start_handoff.get('max_action_step', 0.0)):.3f} "
+                f"action={episode_start_handoff.get('start_action')}"
+                "->"
+                f"{episode_start_handoff.get('end_action')}"
+            )
         if debug_state:
             print(f"[PPO] start state {format_debug_state(debug_state)}")
 
@@ -2233,6 +2518,20 @@ class PPOTrainer:
                 0.0,
             )
         )
+        lateral_error = float(info.get("lateral_position_error_m", 0.0))
+        lateral_velocity = float(info.get("lateral_velocity_mps", 0.0))
+        target_rudder = float(info.get("rudder_recovery_target_deg", 0.0))
+        rudder_features = info.get("rudder_hover_features", {})
+        rudder_error = (
+            float(rudder_features.get("rudder_angle_error_deg", 0.0))
+            if isinstance(rudder_features, dict)
+            else 0.0
+        )
+        yaw_rate = (
+            float(rudder_features.get("yaw_rate_deg_s", 0.0))
+            if isinstance(rudder_features, dict)
+            else 0.0
+        )
         combined_description = (
             f"alt_error={altitude_error:+.2f}m "
             f"up_velocity={upward_velocity:+.2f}m/s "
@@ -2248,6 +2547,12 @@ class PPOTrainer:
             f"pitch_rate={pitch_rate:+.2f}deg/s "
             f"long_error={longitudinal_error:+.2f}m "
             f"long_velocity={longitudinal_velocity:+.2f}m/s "
+            f"rudder={float(env_action[3]):+.3f} "
+            f"rudder_error={rudder_error:+.2f}deg "
+            f"target_rudder={target_rudder:+.2f}deg "
+            f"yaw_rate={yaw_rate:+.2f}deg/s "
+            f"lat_error={lateral_error:+.2f}m "
+            f"lat_velocity={lateral_velocity:+.2f}m/s "
             f"{combined_description}"
             f"radial={radial_distance:.2f}m"
         )
@@ -2440,6 +2745,16 @@ class PPOTrainer:
                         f"entropy_coef={self.entropy_coef}",
                         f"policy_initial_std={self.policy_initial_std}",
                         f"elevator_fixed_throttle={self.elevator_fixed_throttle}",
+                        "episode_start_idle_seconds="
+                        f"{self.config.episode_start_idle_seconds}",
+                        "episode_start_idle_throttle="
+                        f"{self.config.episode_start_idle_throttle}",
+                        "episode_start_idle_curriculum_steps="
+                        f"{self.config.episode_start_idle_curriculum_steps}",
+                        "episode_start_idle_curriculum_start_seconds="
+                        f"{self.config.episode_start_idle_curriculum_start_seconds}",
+                        "episode_start_handoff_seconds="
+                        f"{self.config.episode_start_handoff_seconds}",
                         "elevator_recovery_position_gain_deg_per_m="
                         f"{self.env.reward_config.elevator_recovery_position_gain_deg_per_m}",
                         "elevator_recovery_velocity_gain_deg_per_mps="
@@ -2459,11 +2774,7 @@ class PPOTrainer:
                 0,
             )
         try:
-            observation, info = reset_env_with_wait(
-                self.env,
-                action=self._wait_action(),
-                initial_action=self._initial_action(),
-            )
+            observation, info = self._reset_episode()
             self._log_episode_start(info)
             episode_reward = 0.0
             episode_length = 0
@@ -2523,6 +2834,15 @@ class PPOTrainer:
                             info=info,
                         )
                     if episode_boundary:
+                        if (
+                            truncated
+                            and self._episode_qualifies_for_curriculum_progress(
+                                info
+                            )
+                        ):
+                            self._advance_episode_start_idle_curriculum(
+                                episode_length
+                            )
                         episode_info = dict(info)
                         if truncated and not episode_info.get("termination_reason"):
                             episode_info["termination_reason"] = "truncated"
@@ -2536,22 +2856,9 @@ class PPOTrainer:
                         episode_rewards.append(episode_reward)
                         episode_lengths.append(episode_length)
                         if terminated:
-                            observation, info = reset_env_with_wait(
-                                self.env,
-                                action=self._wait_action(),
-                                initial_action=self._initial_action(),
-                            )
-                        elif (
-                            self.config.control_mode
-                            in CONNECTION_EPISODE_CONTROL_MODES
-                        ):
-                            observation, info = reset_env_with_wait(
-                                self.env,
-                                action=self._wait_action(),
-                                initial_action=self._initial_action(),
-                            )
+                            observation, info = self._reset_episode()
                         else:
-                            observation, info = continue_env_after_truncation(self.env)
+                            observation, info = self._start_after_truncation()
                         self._log_episode_start(info)
                         episode_reward = 0.0
                         episode_length = 0
@@ -2742,20 +3049,29 @@ class PPOTrainer:
                 self.writer.close()
 
     def _evaluate_policy(self):
+        self._evaluating = True
         rewards = []
         lengths = []
         termination_counts = Counter()
         position_errors = []
         altitude_errors = []
         attitude_errors = []
+        idle_end_tilts = []
         observation = None
-        for _ in range(self.config.eval_episodes):
+        for evaluation_index in range(self.config.eval_episodes):
             if observation is None:
-                observation, _ = reset_env_with_wait(
-                    self.env,
-                    action=self._wait_action(),
-                    initial_action=self._initial_action(),
-                )
+                observation, start_info = self._reset_episode()
+                self._log_episode_start(start_info)
+                episode_start_idle = start_info.get("episode_start_idle", {})
+                if isinstance(episode_start_idle, dict):
+                    idle_end_tilts.append(
+                        float(
+                            episode_start_idle.get(
+                                "control_start_tilt_deg",
+                                0.0,
+                            )
+                        )
+                    )
             episode_reward = 0.0
             episode_length = 0
             while True:
@@ -2881,10 +3197,25 @@ class PPOTrainer:
                     termination_counts[reason] += 1
                     if (
                         truncated
-                        and self.config.control_mode
-                        not in CONNECTION_EPISODE_CONTROL_MODES
+                        and evaluation_index + 1 < self.config.eval_episodes
                     ):
-                        observation, _ = continue_env_after_truncation(self.env)
+                        observation, start_info = (
+                            self._start_after_truncation()
+                        )
+                        self._log_episode_start(start_info)
+                        episode_start_idle = start_info.get(
+                            "episode_start_idle",
+                            {},
+                        )
+                        if isinstance(episode_start_idle, dict):
+                            idle_end_tilts.append(
+                                float(
+                                    episode_start_idle.get(
+                                        "control_start_tilt_deg",
+                                        0.0,
+                                    )
+                                )
+                            )
                     else:
                         observation = None
                     break
@@ -2895,7 +3226,12 @@ class PPOTrainer:
         reward_per_step = float(np.sum(rewards) / max(1, np.sum(lengths)))
         print(
             f"Evaluation: avg_reward={avg_reward:.3f}, avg_length={avg_length:.1f}, "
-            f"reward_per_step={reward_per_step:.3f}"
+            f"reward_per_step={reward_per_step:.3f}, "
+            f"position_error={float(np.mean(position_errors)) if position_errors else 0.0:.3f}m, "
+            f"altitude_error={float(np.mean(altitude_errors)) if altitude_errors else 0.0:.3f}m, "
+            f"attitude_error={float(np.mean(attitude_errors)) if attitude_errors else 0.0:.3f}deg, "
+            f"idle_end_tilt={float(np.mean(idle_end_tilts)) if idle_end_tilts else 0.0:.3f}deg, "
+            f"terminations={dict(termination_counts)}"
         )
         self._write_scalar("eval/avg_reward", avg_reward, self.config.timesteps)
         self._write_scalar("eval/avg_length", avg_length, self.config.timesteps)
@@ -2922,6 +3258,7 @@ class PPOTrainer:
                 float(count) / max(1, self.config.eval_episodes),
                 self.config.timesteps,
             )
+        self._evaluating = False
 
 
 class PPOPlayer:
@@ -2958,13 +3295,28 @@ class PPOPlayer:
             control_mode=self.control_mode,
         ).to(self.device)
         try:
-            self.model.load_state_dict(checkpoint.model_state_dict, strict=True)
+            incompatible = self.model.load_state_dict(
+                checkpoint.model_state_dict,
+                strict=False,
+            )
         except RuntimeError as exc:
             self.env.close()
             raise ValueError(
                 "PPO checkpoint is incompatible with the current HoverPilot policy architecture: "
                 f"{exc}"
             ) from exc
+        allowed_missing = {"policy_mean.weight", "policy_mean.bias"}
+        if (
+            set(incompatible.missing_keys) - allowed_missing
+            or incompatible.unexpected_keys
+        ):
+            self.env.close()
+            raise ValueError(
+                "PPO checkpoint is incompatible with the current HoverPilot "
+                "policy architecture: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
         self.model.eval()
 
     def _build_env(self) -> gym.Env:
@@ -3119,6 +3471,7 @@ def reset_env_with_wait(
     *,
     action: Optional[Union[np.ndarray, list, tuple]] = None,
     initial_action: Optional[Union[np.ndarray, list, tuple]] = None,
+    require_reset_boundary: bool = False,
 ):
     if getattr(env, "_waiting_for_reset", False):
         poll_wait = getattr(env, "poll_wait_for_next_episode", None)
@@ -3128,8 +3481,12 @@ def reset_env_with_wait(
 
     try:
         reset_options = None
-        if initial_action is not None:
-            reset_options = {"initial_action": initial_action}
+        if initial_action is not None or require_reset_boundary:
+            reset_options = {}
+            if initial_action is not None:
+                reset_options["initial_action"] = initial_action
+            if require_reset_boundary:
+                reset_options["require_reset_boundary"] = True
         return env.reset(options=reset_options)
     except TimeoutError as exc:
         poll_wait = getattr(env, "poll_wait_for_next_episode", None)
@@ -3314,6 +3671,49 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         ),
     )
     train_parser.add_argument(
+        "--episode-start-idle-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Simulator-physics seconds to wait before policy control starts. "
+            "Only the configured idle throttle is applied during this period."
+        ),
+    )
+    train_parser.add_argument(
+        "--episode-start-idle-throttle",
+        type=float,
+        default=0.66,
+        help="Fixed throttle used during the episode start idle period.",
+    )
+    train_parser.add_argument(
+        "--episode-start-idle-curriculum-steps",
+        type=int,
+        default=0,
+        help=(
+            "Linearly increase episode start idle duration from zero to "
+            "--episode-start-idle-seconds over this many control-step "
+            "equivalents. 0 disables the curriculum."
+        ),
+    )
+    train_parser.add_argument(
+        "--episode-start-idle-curriculum-start-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Idle duration at the beginning of a curriculum run. Use this "
+            "to continue a later curriculum stage from a resumed checkpoint."
+        ),
+    )
+    train_parser.add_argument(
+        "--episode-start-handoff-seconds",
+        type=float,
+        default=0.1,
+        help=(
+            "Simulator-physics seconds used to blend idle controls into the "
+            "initial deterministic policy controls."
+        ),
+    )
+    train_parser.add_argument(
         "--checkpoint-interval-steps",
         type=int,
         default=1024,
@@ -3404,6 +3804,15 @@ def main(argv: Optional[List[str]] = None):
             control_mode=args.control_mode,
             policy_preset=args.policy_preset,
             elevator_fixed_throttle=args.elevator_fixed_throttle,
+            episode_start_idle_seconds=args.episode_start_idle_seconds,
+            episode_start_idle_throttle=args.episode_start_idle_throttle,
+            episode_start_idle_curriculum_steps=(
+                args.episode_start_idle_curriculum_steps
+            ),
+            episode_start_idle_curriculum_start_seconds=(
+                args.episode_start_idle_curriculum_start_seconds
+            ),
+            episode_start_handoff_seconds=args.episode_start_handoff_seconds,
             rflink_socket_timeout_s=args.rflink_socket_timeout_s,
             rflink_request_attempts=args.rflink_request_attempts,
             rflink_retry_backoff_s=args.rflink_retry_backoff_s,

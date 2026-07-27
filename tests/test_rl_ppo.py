@@ -2,6 +2,7 @@ import math
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import MagicMock
 
 import gymnasium as gym
 import numpy as np
@@ -244,6 +245,24 @@ class PPOTrainingModuleTests(unittest.TestCase):
             [0.78, 0.0, 0.65, 0.0],
             atol=1.0e-5,
         )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_all_controls_learned_residual_can_override_saturated_prior(self):
+        model = ActorCritic(
+            14,
+            np.asarray([-1.0, -1.0, 0.0, -1.0], dtype=np.float32),
+            np.ones(4, dtype=np.float32),
+            control_mode=CONTROL_MODE_ALL,
+        )
+        with torch.no_grad():
+            model.policy_mean.weight.zero_()
+            model.policy_mean.bias.fill_(-50.0)
+        observation = torch.zeros((1, 14), dtype=torch.float32)
+        observation[0, 0] = -5.0
+
+        action = model.deterministic_action(observation)
+
+        self.assertLess(float(action[0, 0].detach()), 0.0)
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_all_controls_initial_action_uses_validated_trims(self):
@@ -1117,6 +1136,183 @@ class PPOTrainingModuleTests(unittest.TestCase):
         self.assertEqual(args.rflink_retry_backoff_s, 0.1)
         self.assertEqual(args.checkpoint_interval_steps, 1024)
         self.assertEqual(args.policy_preset, POLICY_PRESET_NONE)
+        self.assertEqual(args.episode_start_idle_seconds, 0.0)
+        self.assertEqual(args.episode_start_idle_throttle, 0.66)
+        self.assertEqual(args.episode_start_idle_curriculum_steps, 0)
+        self.assertEqual(
+            args.episode_start_idle_curriculum_start_seconds,
+            0.0,
+        )
+        self.assertEqual(args.episode_start_handoff_seconds, 0.1)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_train_cli_accepts_episode_start_idle_settings(self):
+        args = parse_args(
+            [
+                "train",
+                "--episode-start-idle-seconds",
+                "3",
+                "--episode-start-idle-throttle",
+                "0.66",
+                "--episode-start-idle-curriculum-steps",
+                "30000",
+                "--episode-start-idle-curriculum-start-seconds",
+                "1.0",
+                "--episode-start-handoff-seconds",
+                "0.3",
+            ]
+        )
+
+        self.assertEqual(args.episode_start_idle_seconds, 3.0)
+        self.assertEqual(args.episode_start_idle_throttle, 0.66)
+        self.assertEqual(args.episode_start_idle_curriculum_steps, 30_000)
+        self.assertEqual(
+            args.episode_start_idle_curriculum_start_seconds,
+            1.0,
+        )
+        self.assertEqual(args.episode_start_handoff_seconds, 0.3)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_episode_start_idle_curriculum_reaches_configured_duration(self):
+        trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=30_000,
+                tensorboard_log_dir=None,
+            )
+        )
+
+        self.assertEqual(trainer._episode_start_idle_duration_s(), 0.0)
+        trainer._curriculum_exposure_steps = 15_000
+        self.assertEqual(trainer._episode_start_idle_duration_s(), 1.5)
+        trainer._curriculum_exposure_steps = 30_000
+        self.assertEqual(trainer._episode_start_idle_duration_s(), 3.0)
+        trainer._curriculum_exposure_steps = 60_000
+        self.assertEqual(trainer._episode_start_idle_duration_s(), 3.0)
+        trainer._curriculum_exposure_steps = 0
+        trainer._evaluating = True
+        self.assertEqual(trainer._episode_start_idle_duration_s(), 3.0)
+
+        resumed_trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=20_000,
+                episode_start_idle_curriculum_start_seconds=1.0,
+                tensorboard_log_dir=None,
+            )
+        )
+        self.assertEqual(
+            resumed_trainer._episode_start_idle_duration_s(),
+            1.0,
+        )
+        resumed_trainer._curriculum_exposure_steps = 10_000
+        self.assertEqual(
+            resumed_trainer._episode_start_idle_duration_s(),
+            2.0,
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_curriculum_idle_resets_after_truncation(self):
+        trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=30_000,
+                max_episode_steps=900,
+                tensorboard_log_dir=None,
+            )
+        )
+        expected = (np.zeros(14, dtype=np.float32), {"reset": True})
+        trainer._reset_episode = MagicMock(return_value=expected)
+
+        actual = trainer._start_after_truncation()
+
+        self.assertIs(actual, expected)
+        self.assertEqual(trainer._curriculum_exposure_steps, 0)
+        trainer._reset_episode.assert_called_once_with(
+            require_reset_boundary=True
+        )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_curriculum_advances_with_successful_episode_steps(self):
+        trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=30_000,
+                max_episode_steps=900,
+                tensorboard_log_dir=None,
+            )
+        )
+
+        trainer._advance_episode_start_idle_curriculum(900)
+        self.assertEqual(trainer._curriculum_exposure_steps, 900)
+        trainer._evaluating = True
+        trainer._advance_episode_start_idle_curriculum(900)
+        self.assertEqual(trainer._curriculum_exposure_steps, 900)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_curriculum_progress_requires_stable_hover_endpoint(self):
+        trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=30_000,
+                tensorboard_log_dir=None,
+            )
+        )
+        stable_debug_state = {
+            "distance_from_cylinder_axis_m": 1.5,
+            "velocity_world_u_mps": 0.6,
+            "velocity_world_v_mps": 0.8,
+            "altitude_agl_m": 1.7,
+            "inclination_deg": 82.0,
+        }
+
+        self.assertTrue(
+            trainer._episode_qualifies_for_curriculum_progress(
+                {"debug_state": stable_debug_state}
+            )
+        )
+        for field, unstable_value in (
+            ("distance_from_cylinder_axis_m", 2.1),
+            ("velocity_world_u_mps", 1.6),
+            ("altitude_agl_m", 1.4),
+            ("inclination_deg", 74.0),
+        ):
+            with self.subTest(field=field):
+                unstable_debug_state = dict(stable_debug_state)
+                unstable_debug_state[field] = unstable_value
+                if field == "velocity_world_u_mps":
+                    unstable_debug_state["velocity_world_v_mps"] = 0.0
+                self.assertFalse(
+                    trainer._episode_qualifies_for_curriculum_progress(
+                        {"debug_state": unstable_debug_state}
+                    )
+                )
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_curriculum_keeps_full_handoff_duration_near_zero(self):
+        trainer = PPOTrainer(
+            PPOConfig(
+                episode_start_idle_seconds=3.0,
+                episode_start_idle_curriculum_steps=30_000,
+                episode_start_handoff_seconds=0.3,
+                tensorboard_log_dir=None,
+            )
+        )
+        trainer._curriculum_exposure_steps = 300
+        observation = np.zeros(14, dtype=np.float32)
+        trainer.env.run_episode_start_idle = MagicMock(
+            return_value=(True, observation, {})
+        )
+        trainer.env.run_episode_start_handoff = MagicMock(
+            return_value=(True, observation, {})
+        )
+
+        trainer._apply_episode_start_idle(observation, {})
+
+        handoff_kwargs = (
+            trainer.env.run_episode_start_handoff.call_args.kwargs
+        )
+        self.assertEqual(handoff_kwargs["duration_s"], 0.3)
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_elevator_mode_resolves_longer_safer_training_defaults(self):
@@ -1297,6 +1493,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                         inclination_error_scale_deg=99.0,
                         elevator_recovery_position_gain_deg_per_m=9.0,
                     ),
+                    policy_initial_std=0.03,
                     tensorboard_log_dir=None,
                 )
             )
@@ -1314,6 +1511,13 @@ class PPOTrainingModuleTests(unittest.TestCase):
         self.assertEqual(
             trainer.env.reward_config.elevator_recovery_position_gain_deg_per_m,
             2.5,
+        )
+        torch.testing.assert_close(
+            trainer.model.policy_log_std,
+            torch.full_like(
+                trainer.model.policy_log_std,
+                math.log(0.03),
+            ),
         )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
@@ -1406,6 +1610,54 @@ class PPOTrainingModuleTests(unittest.TestCase):
     def test_reward_scale_must_be_positive(self):
         with self.assertRaisesRegex(ValueError, "reward_scale must be greater than zero"):
             PPOTrainer(PPOConfig(reward_scale=0.0, tensorboard_log_dir=None))
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_episode_start_idle_settings_must_be_bounded(self):
+        with self.assertRaisesRegex(ValueError, "episode_start_idle_seconds"):
+            PPOTrainer(
+                PPOConfig(
+                    episode_start_idle_seconds=-0.1,
+                    tensorboard_log_dir=None,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "episode start idle"):
+            PPOTrainer(
+                PPOConfig(
+                    episode_start_idle_throttle=1.1,
+                    tensorboard_log_dir=None,
+                )
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "episode_start_idle_curriculum_steps",
+        ):
+            PPOTrainer(
+                PPOConfig(
+                    episode_start_idle_curriculum_steps=-1,
+                    tensorboard_log_dir=None,
+                )
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "episode_start_handoff_seconds",
+        ):
+            PPOTrainer(
+                PPOConfig(
+                    episode_start_handoff_seconds=-0.1,
+                    tensorboard_log_dir=None,
+                )
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "episode_start_idle_curriculum_start_seconds",
+        ):
+            PPOTrainer(
+                PPOConfig(
+                    episode_start_idle_seconds=1.0,
+                    episode_start_idle_curriculum_start_seconds=1.1,
+                    tensorboard_log_dir=None,
+                )
+            )
 
     @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
     def test_elevator_fixed_throttle_must_be_bounded(self):
@@ -1865,3 +2117,22 @@ class PPOTrainingModuleTests(unittest.TestCase):
         self.assertEqual(info["episode_start_reason"], "reset_ready")
         self.assertIsNotNone(env.reset_options)
         self.assertIn("initial_action", env.reset_options)
+
+    @unittest.skipIf(IMPORT_ERROR is not None, f"RL dependencies unavailable: {IMPORT_ERROR}")
+    def test_reset_wait_helper_can_require_a_reset_boundary(self):
+        class ReadyResetEnv(ResetWaitEnv):
+            def reset(self, options=None):
+                self.reset_calls += 1
+                self.reset_options = options
+                return np.zeros(12, dtype=np.float32), {
+                    "episode_start_reason": "trainer_reset"
+                }
+
+        env = ReadyResetEnv()
+
+        reset_env_with_wait(env, require_reset_boundary=True)
+
+        self.assertEqual(
+            env.reset_options,
+            {"require_reset_boundary": True},
+        )

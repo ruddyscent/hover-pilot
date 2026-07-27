@@ -52,6 +52,7 @@ DEFAULT_RESET_WAIT_SECONDS = 8.0
 DEFAULT_RESET_POLL_INTERVAL_SECONDS = 0.05
 THROTTLE_HOVER_START_THROTTLE = 0.65
 AILERON_HOVER_START_AILERON = 0.78
+EPISODE_START_HANDOFF_MAX_ACTION_STEP = 0.25
 
 
 class HoverTaskProfile(str, Enum):
@@ -502,6 +503,7 @@ class HoverPilotHoverEnv(gym.Env):
         self._client = None  # type: Optional[RFLinkClient]
         self._episode_steps = 0
         self._last_state = None  # type: Optional[FlightAxisState]
+        self._last_step_physics_dt_s = None  # type: Optional[float]
         self._pending_episode_start = None  # type: Optional[Tuple[FlightAxisState, str]]
         self._waiting_for_reset = False
         self._episode_started = False
@@ -533,6 +535,9 @@ class HoverPilotHoverEnv(gym.Env):
         self,
         state: FlightAxisState,
     ) -> ElevatorHoverFeatures:
+        control_azimuth_deg = self.reward_config.target_azimuth_deg
+        if self.task_profile == STANDARD_HOVER_TASK:
+            control_azimuth_deg += self._aileron_angle_error_deg
         position_rate_mps = self._last_longitudinal_position_rate_mps
         previous_state = self._last_state
         if previous_state is None:
@@ -558,7 +563,7 @@ class HoverPilotHoverEnv(gym.Env):
                 position_rate_mps = project_onto_target_heading(
                     delta_x_m / delta_time_s,
                     delta_y_m / delta_time_s,
-                    self.reward_config.target_azimuth_deg,
+                    control_azimuth_deg,
                 )
             elif (
                 delta_time_s < -self.physics_time_reset_tolerance_s
@@ -570,7 +575,7 @@ class HoverPilotHoverEnv(gym.Env):
             target_x_m=self.reward_config.target_x_m,
             target_y_m=self.reward_config.target_y_m,
             target_altitude_agl_m=self.reward_config.target_altitude_agl_m,
-            target_azimuth_deg=self.reward_config.target_azimuth_deg,
+            target_azimuth_deg=control_azimuth_deg,
             longitudinal_position_rate_mps=position_rate_mps,
         )
 
@@ -610,10 +615,9 @@ class HoverPilotHoverEnv(gym.Env):
         if previous_time_s is not None:
             delta_time_s = physics_time_s - previous_time_s
             if delta_time_s > self.physics_time_reset_tolerance_s:
-                self._aileron_angle_error_deg = angular_error_deg(
+                self._aileron_angle_error_deg = (
                     self._aileron_angle_error_deg
-                    + state.m_rollRate_DEGpSEC * delta_time_s,
-                    0.0,
+                    + state.m_rollRate_DEGpSEC * delta_time_s
                 )
             elif delta_time_s < -self.physics_time_reset_tolerance_s:
                 self._aileron_angle_error_deg = 0.0
@@ -644,15 +648,15 @@ class HoverPilotHoverEnv(gym.Env):
         throttle_features: Optional[ThrottleHoverFeatures] = None,
     ) -> np.ndarray:
         if self.task_profile == STANDARD_HOVER_TASK:
-            pitch_features = (
-                elevator_features
-                if elevator_features is not None
-                else self._compute_elevator_features(state)
-            )
             roll_features = (
                 aileron_features
                 if aileron_features is not None
                 else self._compute_aileron_features(state)
+            )
+            pitch_features = (
+                elevator_features
+                if elevator_features is not None
+                else self._compute_elevator_features(state)
             )
             yaw_features = (
                 rudder_features
@@ -666,6 +670,7 @@ class HoverPilotHoverEnv(gym.Env):
             )
             heading_rad = math.radians(
                 self.reward_config.target_azimuth_deg
+                + self._aileron_angle_error_deg
             )
             lateral_position_error_m = (
                 (
@@ -786,6 +791,7 @@ class HoverPilotHoverEnv(gym.Env):
         super().reset(seed=seed)
         self._episode_steps = 0
         self._last_state = None
+        self._last_step_physics_dt_s = None
         self._pending_episode_start = None
         self._waiting_for_reset = False
         self._episode_started = False
@@ -807,7 +813,13 @@ class HoverPilotHoverEnv(gym.Env):
         if options and "initial_action" in options:
             ready_action = gym_action_to_rf_action(options["initial_action"])
 
-        state, episode_start_reason = self._wait_for_ready_state(ready_action)
+        require_reset_boundary = bool(
+            options and options.get("require_reset_boundary", False)
+        )
+        state, episode_start_reason = self._wait_for_ready_state(
+            ready_action,
+            require_reset_boundary=require_reset_boundary,
+        )
         self._previous_elevator = ready_action.elevator
         self._previous_aileron = ready_action.aileron
         self._previous_rudder = ready_action.rudder
@@ -822,15 +834,26 @@ class HoverPilotHoverEnv(gym.Env):
             time.sleep(self.sleep_interval_s)
 
         rf_action = gym_action_to_rf_action(action)
+        previous_state = self._last_state
         state = self._client.step(rf_action)
-        elevator_features = (
-            self._compute_elevator_features(state)
-            if self.task_profile.uses_elevator_features
-            else None
-        )
+        if previous_state is not None:
+            physics_dt_s = (
+                state.m_currentPhysicsTime_SEC
+                - previous_state.m_currentPhysicsTime_SEC
+            )
+            self._last_step_physics_dt_s = (
+                physics_dt_s
+                if physics_dt_s > self.physics_time_reset_tolerance_s
+                else None
+            )
         aileron_features = (
             self._compute_aileron_features(state)
             if self.task_profile.uses_aileron_features
+            else None
+        )
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile.uses_elevator_features
             else None
         )
         rudder_features = (
@@ -1005,14 +1028,14 @@ class HoverPilotHoverEnv(gym.Env):
             truncated=False,
             reason=assessment.readiness.reason,
         )
-        elevator_features = (
-            self._compute_elevator_features(state)
-            if self.task_profile.uses_elevator_features
-            else None
-        )
         aileron_features = (
             self._compute_aileron_features(state)
             if self.task_profile.uses_aileron_features
+            else None
+        )
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile.uses_elevator_features
             else None
         )
         rudder_features = (
@@ -1074,16 +1097,226 @@ class HoverPilotHoverEnv(gym.Env):
         if self._waiting_for_reset:
             raise RuntimeError("cannot continue a truncated episode while waiting for trainer reset")
 
+        return self._restart_episode_segment("time_limit_continuation")
+
+    def run_episode_start_idle(
+        self,
+        *,
+        duration_s: float,
+        action: Union[np.ndarray, list, tuple],
+    ) -> Tuple[bool, np.ndarray, Dict[str, Any]]:
+        """Hold a fixed action before handing the episode to the policy."""
+
+        if not math.isfinite(duration_s) or duration_s < 0.0:
+            raise ValueError(
+                "episode start idle duration must be finite and non-negative"
+            )
+        if self._last_state is None or not self._episode_started:
+            raise RuntimeError(
+                "cannot run episode start idle without an active episode"
+            )
+        if self._waiting_for_reset:
+            raise RuntimeError(
+                "cannot run episode start idle while waiting for trainer reset"
+            )
+        if duration_s == 0.0:
+            observation, info = self._restart_episode_segment(
+                "episode_start_idle_complete"
+            )
+            return True, observation, info
+
+        hold_action = np.asarray(action, dtype=np.float32)
+        gym_action_to_rf_action(hold_action)
+        initial_state = self._last_state
+        initial_physics_time_s = initial_state.m_currentPhysicsTime_SEC
+        wall_deadline = time.monotonic() + max(duration_s * 3.0, duration_s + 5.0)
+        hold_steps = 0
+        observation = self._state_to_observation(initial_state)
+        info: Dict[str, Any] = {}
+        original_max_episode_steps = self.max_episode_steps
+        self.max_episode_steps = None
+        try:
+            while True:
+                observation, _, terminated, _, info = self.step(hold_action)
+                hold_steps += 1
+                current_physics_time_s = float(
+                    info["debug_state"]["physics_time_s"]
+                )
+                elapsed_physics_s = (
+                    current_physics_time_s - initial_physics_time_s
+                )
+                if terminated:
+                    info["episode_start_idle"] = self._episode_start_idle_details(
+                        initial_state=initial_state,
+                        final_state=self._last_state,
+                        requested_duration_s=duration_s,
+                        elapsed_physics_s=max(0.0, elapsed_physics_s),
+                        hold_steps=hold_steps,
+                        hold_action=hold_action,
+                        completed=False,
+                    )
+                    return False, observation, info
+                if elapsed_physics_s >= duration_s:
+                    break
+                if time.monotonic() >= wall_deadline:
+                    raise TimeoutError(
+                        "timed out waiting for episode start idle physics time "
+                        f"to advance by {duration_s:.3f}s"
+                    )
+        finally:
+            self.max_episode_steps = original_max_episode_steps
+
+        observation, info = self._restart_episode_segment(
+            "episode_start_idle_complete"
+        )
+        info["episode_start_idle"] = self._episode_start_idle_details(
+            initial_state=initial_state,
+            final_state=self._last_state,
+            requested_duration_s=duration_s,
+            elapsed_physics_s=elapsed_physics_s,
+            hold_steps=hold_steps,
+            hold_action=hold_action,
+            completed=True,
+        )
+        return True, observation, info
+
+    def run_episode_start_handoff(
+        self,
+        *,
+        duration_s: float,
+        start_action: Union[np.ndarray, list, tuple],
+        action_provider: Callable[[np.ndarray], Union[np.ndarray, list, tuple]],
+    ) -> Tuple[bool, np.ndarray, Dict[str, Any]]:
+        """Smoothly blend idle controls into live policy controls."""
+
+        if not math.isfinite(duration_s) or duration_s < 0.0:
+            raise ValueError(
+                "episode start handoff duration must be finite and non-negative"
+            )
+        if self._last_state is None or not self._episode_started:
+            raise RuntimeError(
+                "cannot run episode start handoff without an active episode"
+            )
+        if self._waiting_for_reset:
+            raise RuntimeError(
+                "cannot run episode start handoff while waiting for trainer reset"
+            )
+
+        initial_action = np.asarray(start_action, dtype=np.float32)
+        gym_action_to_rf_action(initial_action)
+        initial_state = self._last_state
+        initial_physics_time_s = initial_state.m_currentPhysicsTime_SEC
+        wall_deadline = time.monotonic() + max(duration_s * 3.0, duration_s + 5.0)
+        handoff_steps = 0
+        elapsed_physics_s = 0.0
+        observation = self._state_to_observation(initial_state)
+        target_action = np.asarray(
+            action_provider(observation),
+            dtype=np.float32,
+        )
+        gym_action_to_rf_action(target_action)
+        last_action = initial_action.copy()
+        max_action_step = 0.0
+        info: Dict[str, Any] = {}
+        original_max_episode_steps = self.max_episode_steps
+        self.max_episode_steps = None
+        try:
+            while True:
+                progress = (
+                    (
+                        elapsed_physics_s
+                        + (self._last_step_physics_dt_s or 0.0)
+                    )
+                    / duration_s
+                    if duration_s > 0.0
+                    else 1.0
+                )
+                progress = min(1.0, progress)
+                smooth_progress = progress * progress * (
+                    3.0 - 2.0 * progress
+                )
+                blended_action = initial_action + smooth_progress * (
+                    target_action - initial_action
+                )
+                action = np.clip(
+                    blended_action,
+                    last_action - EPISODE_START_HANDOFF_MAX_ACTION_STEP,
+                    last_action + EPISODE_START_HANDOFF_MAX_ACTION_STEP,
+                )
+                max_action_step = max(
+                    max_action_step,
+                    float(np.max(np.abs(action - last_action))),
+                )
+                last_action = action
+                observation, _, terminated, _, info = self.step(action)
+                handoff_steps += 1
+                elapsed_physics_s = max(
+                    0.0,
+                    float(info["debug_state"]["physics_time_s"])
+                    - initial_physics_time_s,
+                )
+                if terminated:
+                    info["episode_start_handoff"] = (
+                        self._episode_start_handoff_details(
+                            requested_duration_s=duration_s,
+                            elapsed_physics_s=elapsed_physics_s,
+                            handoff_steps=handoff_steps,
+                            start_action=initial_action,
+                            end_action=target_action,
+                            max_action_step=max_action_step,
+                            completed=False,
+                        )
+                    )
+                    return False, observation, info
+                next_target_action = np.asarray(
+                    action_provider(observation),
+                    dtype=np.float32,
+                )
+                gym_action_to_rf_action(next_target_action)
+                if (
+                    elapsed_physics_s >= duration_s
+                    and np.max(np.abs(next_target_action - action))
+                    <= EPISODE_START_HANDOFF_MAX_ACTION_STEP
+                ):
+                    target_action = next_target_action
+                    break
+                target_action = next_target_action
+                if time.monotonic() >= wall_deadline:
+                    raise TimeoutError(
+                        "timed out waiting for episode start handoff physics "
+                        f"time to advance by {duration_s:.3f}s"
+                    )
+        finally:
+            self.max_episode_steps = original_max_episode_steps
+
+        observation, info = self._restart_episode_segment(
+            "episode_start_handoff_complete"
+        )
+        info["episode_start_handoff"] = self._episode_start_handoff_details(
+            requested_duration_s=duration_s,
+            elapsed_physics_s=elapsed_physics_s,
+            handoff_steps=handoff_steps,
+            start_action=initial_action,
+            end_action=target_action,
+            max_action_step=max_action_step,
+            completed=True,
+        )
+        return True, observation, info
+
+    def _restart_episode_segment(
+        self,
+        episode_start_reason: str,
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
         self._episode_steps = 0
         state = self._last_state
-        elevator_features = (
-            self._compute_elevator_features(state)
-            if self.task_profile.uses_elevator_features
-            else None
-        )
         aileron_features = (
             self._compute_aileron_features(state)
             if self.task_profile.uses_aileron_features
+            else None
+        )
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile.uses_elevator_features
             else None
         )
         rudder_features = (
@@ -1102,14 +1335,14 @@ class HoverPilotHoverEnv(gym.Env):
             started=True,
             terminated=False,
             truncated=False,
-            reason="time_limit_continuation",
+            reason=episode_start_reason,
         )
         info = self._build_info(
             state=state,
             reward_breakdown=None,
             truncated=False,
             reset=False,
-            episode_start_reason="time_limit_continuation",
+            episode_start_reason=episode_start_reason,
             waiting_for_reset=False,
             lifecycle=lifecycle,
             readiness=readiness,
@@ -1127,6 +1360,55 @@ class HoverPilotHoverEnv(gym.Env):
             throttle_features=throttle_features,
         )
         return observation, info
+
+    @staticmethod
+    def _episode_start_idle_details(
+        *,
+        initial_state: FlightAxisState,
+        final_state: FlightAxisState,
+        requested_duration_s: float,
+        elapsed_physics_s: float,
+        hold_steps: int,
+        hold_action: np.ndarray,
+        completed: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "completed": completed,
+            "requested_duration_s": requested_duration_s,
+            "elapsed_physics_s": elapsed_physics_s,
+            "hold_steps": hold_steps,
+            "throttle": float(hold_action[2]),
+            "initial_tilt_deg": abs(
+                initial_state.m_inclination_DEG - HOVER_TARGET_INCLINATION_DEG
+            ),
+            "control_start_tilt_deg": abs(
+                final_state.m_inclination_DEG - HOVER_TARGET_INCLINATION_DEG
+            ),
+            "initial_altitude_agl_m": initial_state.m_altitudeAGL_MTR,
+            "control_start_altitude_agl_m": final_state.m_altitudeAGL_MTR,
+        }
+
+    @staticmethod
+    def _episode_start_handoff_details(
+        *,
+        requested_duration_s: float,
+        elapsed_physics_s: float,
+        handoff_steps: int,
+        start_action: np.ndarray,
+        end_action: np.ndarray,
+        max_action_step: float,
+        completed: bool,
+    ) -> Dict[str, Any]:
+        return {
+            "completed": completed,
+            "requested_duration_s": requested_duration_s,
+            "elapsed_physics_s": elapsed_physics_s,
+            "handoff_steps": handoff_steps,
+            "start_action": start_action.astype(float).tolist(),
+            "end_action": end_action.astype(float).tolist(),
+            "max_action_delta": float(np.max(np.abs(end_action - start_action))),
+            "max_action_step": max_action_step,
+        }
 
     def render(self):
         return None
@@ -1164,11 +1446,17 @@ class HoverPilotHoverEnv(gym.Env):
             return EpisodeLifecycleResult(False, False, False, False, "touching_ground")
         return EpisodeLifecycleResult(True, True, False, False, None)
 
-    def _wait_for_ready_state(self, action: RFControlAction) -> Tuple[FlightAxisState, str]:
+    def _wait_for_ready_state(
+        self,
+        action: RFControlAction,
+        *,
+        require_reset_boundary: bool = False,
+    ) -> Tuple[FlightAxisState, str]:
         deadline = time.monotonic() + self.max_reset_wait_seconds
         last_state = None  # type: Optional[FlightAxisState]
         last_reason = "reset_timeout"
-        startup_sync_required = False
+        startup_sync_required = require_reset_boundary
+        self._waiting_for_reset = require_reset_boundary
         pending_start_reason = None  # type: Optional[str]
         while time.monotonic() <= deadline:
             state = self._poll_state(action, interval_s=self.reset_poll_interval_seconds)
@@ -1256,6 +1544,7 @@ class HoverPilotHoverEnv(gym.Env):
         self._episode_frame_initialized = True
         self._last_longitudinal_position_rate_mps = 0.0
         self._last_state = state
+        self._last_step_physics_dt_s = None
         self._aileron_angle_error_deg = 0.0
         self._last_aileron_feature_physics_time_s = (
             state.m_currentPhysicsTime_SEC
@@ -1264,14 +1553,14 @@ class HoverPilotHoverEnv(gym.Env):
         self._last_rudder_feature_physics_time_s = (
             state.m_currentPhysicsTime_SEC
         )
-        elevator_features = (
-            self._compute_elevator_features(state)
-            if self.task_profile.uses_elevator_features
-            else None
-        )
         aileron_features = (
             self._compute_aileron_features(state)
             if self.task_profile.uses_aileron_features
+            else None
+        )
+        elevator_features = (
+            self._compute_elevator_features(state)
+            if self.task_profile.uses_elevator_features
             else None
         )
         rudder_features = (
@@ -1420,6 +1709,7 @@ class HoverPilotHoverEnv(gym.Env):
             if self.task_profile == STANDARD_HOVER_TASK:
                 heading_rad = math.radians(
                     self.reward_config.target_azimuth_deg
+                    + self._aileron_angle_error_deg
                 )
                 dx = (
                     state.m_aircraftPositionX_MTR

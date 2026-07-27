@@ -31,7 +31,7 @@ class RewardConfig:
     target_azimuth_deg: float = 0.0
     trainer_cylinder_radius_m: float = 6.0
     min_altitude_agl_m: float = 0.2
-    position_error_weight: float = 0.15
+    position_error_weight: float = 4.0
     survival_reward: float = 1.0
     elevator_position_error_weight: float = 0.2
     elevator_altitude_error_weight: float = 0.1

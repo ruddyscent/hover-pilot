@@ -1188,6 +1188,178 @@ class HoverEnvTests(unittest.TestCase):
         self.assertIn("throttle_hover_features", info)
         env.close()
 
+    def test_episode_start_idle_holds_only_throttle_and_preserves_target_frame(self):
+        client = StubRFLinkClient(
+            [
+                self._state(
+                    m_currentPhysicsTime_SEC=10.0,
+                    m_azimuth_DEG=10.0,
+                ),
+                self._state(
+                    m_currentPhysicsTime_SEC=11.0,
+                    m_azimuth_DEG=20.0,
+                    m_inclination_DEG=80.0,
+                ),
+                self._state(
+                    m_currentPhysicsTime_SEC=12.0,
+                    m_azimuth_DEG=30.0,
+                    m_inclination_DEG=70.0,
+                ),
+                self._state(
+                    m_currentPhysicsTime_SEC=13.0,
+                    m_azimuth_DEG=40.0,
+                    m_inclination_DEG=60.0,
+                ),
+            ]
+        )
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            max_episode_steps=1,
+            client_factory=lambda: client,
+        )
+        env.reset()
+
+        started, observation, info = env.run_episode_start_idle(
+            duration_s=3.0,
+            action=np.asarray([0.0, 0.0, 0.60, 0.0], dtype=np.float32),
+        )
+
+        self.assertTrue(started)
+        self.assertEqual(observation.shape, (14,))
+        self.assertEqual(
+            info["episode_start_reason"],
+            "episode_start_idle_complete",
+        )
+        self.assertEqual(info["episode_step"], 0)
+        self.assertAlmostEqual(info["target_hover"]["azimuth_deg"], 10.0)
+        self.assertEqual(info["episode_start_idle"]["hold_steps"], 3)
+        self.assertAlmostEqual(
+            info["episode_start_idle"]["elapsed_physics_s"],
+            3.0,
+        )
+        self.assertAlmostEqual(
+            info["episode_start_idle"]["control_start_tilt_deg"],
+            30.0,
+        )
+        for action in client.actions[1:]:
+            self.assertEqual(action.aileron, 0.0)
+            self.assertEqual(action.elevator, 0.0)
+            self.assertAlmostEqual(action.throttle, 0.60)
+            self.assertEqual(action.rudder, 0.0)
+        env.close()
+
+    def test_episode_start_handoff_blends_into_policy_action(self):
+        client = StubRFLinkClient(
+            [
+                self._state(m_currentPhysicsTime_SEC=10.0),
+                self._state(m_currentPhysicsTime_SEC=10.5),
+                self._state(m_currentPhysicsTime_SEC=11.0),
+                self._state(m_currentPhysicsTime_SEC=11.1),
+            ]
+        )
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            max_episode_steps=1,
+            client_factory=lambda: client,
+        )
+        env.reset()
+
+        policy_actions = iter(
+            (
+                [0.8, -0.4, 0.70, 0.2],
+                [0.6, -0.2, 0.68, 0.1],
+                [0.4, -0.1, 0.67, 0.05],
+            )
+        )
+        started, observation, info = env.run_episode_start_handoff(
+            duration_s=1.0,
+            start_action=np.asarray([0.0, 0.0, 0.66, 0.0], dtype=np.float32),
+            action_provider=lambda observation: next(policy_actions),
+        )
+
+        self.assertTrue(started)
+        self.assertEqual(observation.shape, (14,))
+        self.assertEqual(
+            info["episode_start_reason"],
+            "episode_start_handoff_complete",
+        )
+        self.assertEqual(info["episode_step"], 0)
+        handoff = info["episode_start_handoff"]
+        self.assertEqual(handoff["handoff_steps"], 2)
+        self.assertAlmostEqual(handoff["elapsed_physics_s"], 1.0)
+        self.assertAlmostEqual(handoff["max_action_delta"], 0.4)
+        self.assertAlmostEqual(handoff["max_action_step"], 0.25)
+        actual_actions = client.actions[1:]
+        self.assertEqual(len(actual_actions), 2)
+        np.testing.assert_allclose(
+            [
+                actual_actions[0].aileron,
+                actual_actions[0].elevator,
+                actual_actions[0].throttle,
+                actual_actions[0].rudder,
+            ],
+            [0.0, 0.0, 0.66, 0.0],
+        )
+        np.testing.assert_allclose(
+            [
+                actual_actions[1].aileron,
+                actual_actions[1].elevator,
+                actual_actions[1].throttle,
+                actual_actions[1].rudder,
+            ],
+            [0.25, -0.2, 0.68, 0.1],
+        )
+        env.close()
+
+    def test_episode_start_handoff_uses_idle_step_duration_for_first_blend(self):
+        client = StubRFLinkClient(
+            [
+                self._state(m_currentPhysicsTime_SEC=10.0),
+                self._state(m_currentPhysicsTime_SEC=10.25),
+                self._state(m_currentPhysicsTime_SEC=10.5),
+                self._state(m_currentPhysicsTime_SEC=10.75),
+                self._state(m_currentPhysicsTime_SEC=11.0),
+                self._state(m_currentPhysicsTime_SEC=11.25),
+                self._state(m_currentPhysicsTime_SEC=11.5),
+            ]
+        )
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            client_factory=lambda: client,
+        )
+        env.reset()
+        started, _, _ = env.run_episode_start_idle(
+            duration_s=0.5,
+            action=np.asarray([0.0, 0.0, 0.66, 0.0], dtype=np.float32),
+        )
+        self.assertTrue(started)
+
+        started, _, info = env.run_episode_start_handoff(
+            duration_s=1.0,
+            start_action=np.asarray([0.0, 0.0, 0.66, 0.0], dtype=np.float32),
+            action_provider=lambda observation: np.asarray(
+                [0.8, -0.4, 0.70, 0.2],
+                dtype=np.float32,
+            ),
+        )
+
+        self.assertTrue(started)
+        self.assertEqual(info["episode_start_handoff"]["handoff_steps"], 4)
+        first_handoff_action = client.actions[3]
+        np.testing.assert_allclose(
+            [
+                first_handoff_action.aileron,
+                first_handoff_action.elevator,
+                first_handoff_action.throttle,
+                first_handoff_action.rudder,
+            ],
+            [0.125, -0.0625, 0.66625, 0.03125],
+        )
+        env.close()
+
     def test_standard_mode_integrates_body_roll_rate_across_euler_jump(self):
         client = StubRFLinkClient([
             self._state(),
@@ -1218,6 +1390,25 @@ class HoverEnvTests(unittest.TestCase):
         )
         env.close()
 
+    def test_standard_mode_keeps_integrated_roll_continuous_past_180_degrees(self):
+        env = HoverPilotHoverEnv(
+            host="127.0.0.1",
+            port=18083,
+            client_factory=lambda: StubRFLinkClient([]),
+        )
+        env._aileron_angle_error_deg = 179.0
+        env._last_aileron_feature_physics_time_s = 10.0
+
+        features = env._compute_aileron_features(
+            self._state(
+                m_currentPhysicsTime_SEC=10.1,
+                m_rollRate_DEGpSEC=20.0,
+            )
+        )
+
+        self.assertAlmostEqual(features.roll_error_deg, 181.0)
+        env.close()
+
     def test_reset_keeps_fixed_world_hover_target(self):
         client = StubRFLinkClient([
             self._state(m_aircraftPositionX_MTR=12.5, m_aircraftPositionY_MTR=-3.0, m_altitudeAGL_MTR=4.2)
@@ -1237,6 +1428,35 @@ class HoverEnvTests(unittest.TestCase):
             HOVER_TARGET_ALTITUDE_AGL_M,
         )
         self.assertEqual(info["target_hover"]["inclination_deg"], 90.0)
+        env.close()
+
+    def test_standard_hover_rotates_position_errors_into_current_control_axes(self):
+        env = HoverPilotHoverEnv(
+            host="test",
+            port=18083,
+            task_profile=STANDARD_HOVER_TASK,
+            client_factory=lambda: StubRFLinkClient([]),
+        )
+        env._aileron_angle_error_deg = 90.0
+        state = self._state(
+            m_aircraftPositionX_MTR=HOVER_TARGET_X_M + 2.0,
+        )
+        elevator_features = env._compute_elevator_features(state)
+
+        observation = env._state_to_observation(
+            state,
+            elevator_features=elevator_features,
+            aileron_features=AileronHoverFeatures(90.0, 0.0),
+            rudder_features=RudderHoverFeatures(0.0, 0.0),
+            throttle_features=ThrottleHoverFeatures(0.0, 0.0),
+        )
+
+        self.assertAlmostEqual(
+            elevator_features.longitudinal_position_error_m,
+            2.0,
+        )
+        self.assertAlmostEqual(observation[4], 2.0 / 4.0)
+        self.assertAlmostEqual(observation[12], 0.0, places=6)
         env.close()
 
     def test_locked_state_is_not_ready(self):

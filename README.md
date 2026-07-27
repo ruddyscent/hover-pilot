@@ -318,6 +318,34 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
+To train recovery after an uncontrolled episode start, hold only throttle before
+handing control to the policy:
+
+```bash
+uv run hoverpilot-ppo train \
+  --episode-start-idle-seconds 3.0 \
+  --episode-start-idle-throttle 0.66 \
+  --episode-start-idle-curriculum-steps 60000 \
+  --episode-start-handoff-seconds 0.1 \
+  --max-episode-steps 600 \
+  --timesteps 120000 \
+  --save-path ppo_hoverpilot_recovery.pt
+```
+
+The idle duration is measured in simulator physics time and is applied at the
+start of every training episode. The curriculum increases it linearly from zero
+to three seconds using control steps from completed episodes, while the other
+three controls remain neutral. Failed recovery attempts remain in the PPO
+rollouts but pause the difficulty increase until the policy completes the
+current stage. A completed episode advances the curriculum only when its final
+position, horizontal speed, altitude, and tilt are also within the stable-hover
+limits. The handoff period uses a cubic smoothstep, refreshes the deterministic
+policy target on every simulator step, and limits a single control update to
+0.25. Its configured duration is kept even at the beginning of the curriculum,
+preventing a short idle period or a large simulator-time update from collapsing
+the blend into a control jump. A zero-second idle duration (the default)
+preserves the standard immediate-control behavior.
+
 The all-controls actor combines the independently validated structured
 aileron, elevator, throttle, and rudder policies. Elevator drives longitudinal
 position back to the origin; rudder performs the equivalent lateral recovery.
@@ -603,8 +631,11 @@ List all training options with:
 uv run hoverpilot-ppo train --help
 ```
 
-The task-specific switches are `--control-mode`, `--policy-preset`,
-`--elevator-fixed-throttle`, `--resume-from`, and
+The task-specific switches include `--control-mode`, `--policy-preset`,
+`--elevator-fixed-throttle`, `--episode-start-idle-seconds`,
+`--episode-start-idle-throttle`, `--episode-start-idle-curriculum-steps`,
+`--episode-start-idle-curriculum-start-seconds`,
+`--episode-start-handoff-seconds`, `--resume-from`, and
 `--checkpoint-interval-steps`.
 
 To disable TensorBoard logging for a run:
