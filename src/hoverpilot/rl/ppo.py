@@ -318,6 +318,8 @@ def _resolve_training_defaults(config: PPOConfig) -> PPOConfig:
     )
 
 
+# Actor-critic architecture (Sutton & Barto, 2018, Sections 13.2 and 13.5).
+# http://incompleteideas.net/book/the-book-2nd.html
 class ActorCritic(nn.Module):
     _SQUASH_EPSILON = 1.0e-6
 
@@ -867,6 +869,12 @@ class RolloutBuffer:
         last_value_tensor = torch.tensor(last_value, dtype=torch.float32, device=self.device)
         for step in reversed(range(self.index)):
             next_value = last_value_tensor if step == self.index - 1 else self.values[step + 1]
+            # The one-step TD error follows Eq. (6.5)
+            # (Sutton & Barto, 2018, Section 6.1).
+            # The backward weighted accumulation is conceptually related to
+            # the lambda-return; GAE applies that idea to advantage estimates
+            # (Sutton & Barto, 2018, Sections 12.1-12.2).
+            # http://incompleteideas.net/book/the-book-2nd.html
             delta = self.rewards[step] + gamma * next_value * self.dones[step] - self.values[step]
             gae = delta + gamma * lam * self.dones[step] * gae
             self.advantages[step] = gae
