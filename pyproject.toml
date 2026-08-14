@@ -47,7 +47,7 @@ rl = [
 [project.scripts]
 hoverpilot-demo = "hoverpilot.main:main"
 hoverpilot-validate = "hoverpilot.validate_env:main"
-hoverpilot-ppo = "hoverpilot.rl.ppo:main"
+hoverpilot-ppo = "hoverpilot.rl.cli:main"
 
 [dependency-groups]
 dev = [

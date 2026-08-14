@@ -189,7 +189,8 @@ The environment prefers explicit RealFlight Link reset signals first. Teleport /
 
 ## PPO Training and Environment Validation
 
-A lightweight PPO trainer is now available in `hoverpilot.rl.ppo`.
+A lightweight PPO trainer is available through the `hoverpilot-ppo` command.
+Its implementation is split across the focused modules in `hoverpilot.rl`.
 
 ### macOS Metal / MPS
 

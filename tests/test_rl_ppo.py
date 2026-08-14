@@ -30,8 +30,14 @@ except ImportError as exc:
     resolve_device = None
     IMPORT_ERROR = exc
 else:
-    from hoverpilot.rl.ppo import (
-        ActorCritic,
+    from hoverpilot.rl.buffer import RolloutBuffer
+    from hoverpilot.rl.checkpoints import (
+        build_policy_checkpoint,
+        load_policy_checkpoint,
+    )
+    from hoverpilot.rl.cli import parse_args
+    from hoverpilot.rl.config import PPOConfig, PPOPlayConfig
+    from hoverpilot.rl.constants import (
         CONTROL_MODE_AILERON,
         CONTROL_MODE_AILERON_THROTTLE,
         CONTROL_MODE_ALL,
@@ -44,19 +50,16 @@ else:
         POLICY_PRESET_NONE,
         PPO_CHECKPOINT_FORMAT,
         PPO_CHECKPOINT_VERSION,
-        PPOPlayConfig,
-        PPOPlayer,
-        PPOConfig,
-        PPOTrainer,
-        RolloutBuffer,
-        build_policy_checkpoint,
+    )
+    from hoverpilot.rl.models import ActorCritic
+    from hoverpilot.rl.player import PPOPlayer
+    from hoverpilot.rl.runtime import (
         _expand_policy_action,
         _initial_env_action,
-        load_policy_checkpoint,
-        parse_args,
         reset_env_with_wait,
         resolve_device,
     )
+    from hoverpilot.rl.trainer import PPOTrainer
     IMPORT_ERROR = None
 
 
