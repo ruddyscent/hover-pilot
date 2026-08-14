@@ -27,7 +27,8 @@ dependencies = [
     "gymnasium",
     "numpy",
     "pydantic",
-    "python-dotenv>=1.2.2"
+    "python-dotenv>=1.2.2",
+    "tomli>=2.2.1; python_version < '3.11'",
 ]
 
 [project.urls]

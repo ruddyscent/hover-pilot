@@ -1,0 +1,30 @@
+[environment]
+host = "127.0.0.1"
+port = 18083
+max_episode_steps = 300
+
+[training]
+timesteps = 300000
+seed = 42
+n_steps = 1024
+batch_size = 64
+epochs = 5
+learning_rate = 0.0001
+device = "auto"
+
+[policy]
+control_mode = "elevator"
+policy_preset = "none"
+elevator_fixed_throttle = 0.55
+
+[checkpoint]
+save_path = "checkpoints/elevator.pt"
+checkpoint_interval_steps = 1024
+
+[evaluation]
+eval_episodes = 10
+eval_interval_steps = 10240
+
+[logging]
+enabled = true
+tensorboard_log_dir = "runs/elevator"

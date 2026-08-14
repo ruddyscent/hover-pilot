@@ -64,6 +64,7 @@ class PPOConfig:
     checkpoint_interval_steps: int = 1024
     eval_interval_steps: int = 10240
     best_save_path: Optional[str] = None
+    config_path: Optional[str] = None
 
 
 @dataclass
@@ -90,3 +91,4 @@ class PPOCheckpoint:
     policy_preset: str
     elevator_fixed_throttle: float
     observation_config: Mapping[str, float]
+    experiment_metadata: Mapping[str, object] = field(default_factory=dict)

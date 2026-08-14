@@ -1722,8 +1722,14 @@ class PPOTrainingModuleTests(unittest.TestCase):
                     "policy_preset",
                     "elevator_fixed_throttle",
                     "observation_config",
+                    "experiment_metadata",
                 },
             )
+            self.assertEqual(
+                saved_checkpoint["experiment_metadata"]["package_version"],
+                "2.0.0",
+            )
+            self.assertIn("resolved_config", saved_checkpoint["experiment_metadata"])
             self.assertEqual(saved_checkpoint["checkpoint_format"], PPO_CHECKPOINT_FORMAT)
             self.assertEqual(saved_checkpoint["format_version"], PPO_CHECKPOINT_VERSION)
             self.assertIn(

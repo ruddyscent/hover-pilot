@@ -15,6 +15,7 @@ from .constants import (
     POLICY_PRESET_NONE,
     POLICY_PRESETS,
 )
+from .experiment_config import load_experiment_config
 from .player import PPOPlayer
 from .trainer import PPOTrainer
 
@@ -50,6 +51,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     subparsers.required = True
 
     train_parser = subparsers.add_parser("train", help="Train a PPO policy")
+    train_parser.add_argument(
+        "--config",
+        help="Load experiment defaults from a TOML file. CLI options override it.",
+    )
     train_parser.add_argument(
         "--timesteps",
         type=int,
@@ -127,6 +132,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo"
     )
     train_parser.add_argument("--disable-tensorboard", action="store_true")
+    train_parser.add_argument(
+        "--enable-tensorboard",
+        action="store_false",
+        dest="disable_tensorboard",
+        help="Enable TensorBoard even when the TOML configuration disables it.",
+    )
     train_parser.add_argument(
         "--control-mode",
         choices=CONTROL_MODES,
@@ -289,6 +300,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     diagnose_parser.add_argument("--settle-steps", type=int, default=8)
     _add_rflink_args(diagnose_parser)
 
+    config_probe = argparse.ArgumentParser(add_help=False)
+    config_probe.add_argument("command", nargs="?")
+    config_probe.add_argument("--config")
+    probed, _ = config_probe.parse_known_args(argv)
+    if probed.command == "train" and probed.config:
+        train_parser.set_defaults(**load_experiment_config(probed.config))
+
     return parser.parse_args(argv)
 
 
@@ -342,6 +360,7 @@ def main(argv: Optional[List[str]] = None):
             checkpoint_interval_steps=args.checkpoint_interval_steps,
             eval_interval_steps=args.eval_interval_steps,
             best_save_path=args.best_save_path,
+            config_path=args.config,
         )
         trainer = PPOTrainer(config)
         trainer.train()

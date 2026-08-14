@@ -55,6 +55,7 @@ from .constants import (
     _ELEVATOR_EFFECTIVE_RESTORING_ACTION,
     _THROTTLE_PPO_INITIAL_TRIM,
 )
+from .experiment_config import build_experiment_metadata
 from .models import ActorCritic
 from .runtime import (
     _build_hover_env,
@@ -157,6 +158,9 @@ class PPOTrainer:
                 "PPO config",
             )
         self.config = config
+        self.experiment_metadata = build_experiment_metadata(
+            config, config_path=config.config_path
+        )
         self.entropy_coef = (
             config.entropy_coef
             if config.entropy_coef is not None
@@ -1444,6 +1448,7 @@ class PPOTrainer:
                     control_mode=self.config.control_mode,
                     elevator_fixed_throttle=self.elevator_fixed_throttle,
                     reward_config=self.config.reward_config,
+                    experiment_metadata=self.experiment_metadata,
                 ),
                 temporary_path,
             )

@@ -319,6 +319,32 @@ Train a policy (requires torch):
 uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 ```
 
+### TOML experiment configuration
+
+For repeatable experiments, start from the included
+[`configs/elevator.toml`](../configs/elevator.toml):
+
+```bash
+uv run hoverpilot-ppo train --config configs/elevator.toml
+```
+
+The file groups settings under `[environment]`, `[training]`, `[policy]`,
+`[episode_start]`, `[checkpoint]`, `[evaluation]`, `[logging]`, and `[rflink]`.
+Unknown sections and keys are rejected so spelling mistakes cannot silently use
+a default value. Explicit command-line options override values loaded from TOML:
+
+```bash
+uv run hoverpilot-ppo train \
+  --config configs/elevator.toml \
+  --seed 43 \
+  --timesteps 50000
+```
+
+Each saved checkpoint includes the parsed TOML document, its absolute source
+path, the fully resolved training configuration, seed, installed HoverPilot
+version, and current Git commit. The path is informational; the embedded
+configuration remains available if the original TOML file is moved.
+
 To train recovery after an uncontrolled episode start, hold only throttle before
 handing control to the policy:
 

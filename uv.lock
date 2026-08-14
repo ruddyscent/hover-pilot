@@ -250,6 +250,7 @@ dependencies = [
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pydantic" },
     { name = "python-dotenv" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.optional-dependencies]
@@ -270,6 +271,7 @@ requires-dist = [
     { name = "pydantic" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "tensorboard", marker = "extra == 'rl'", specifier = ">=2.21.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.2.1" },
     { name = "torch", marker = "extra == 'rl'", specifier = ">=2.13.0" },
 ]
 provides-extras = ["rl"]

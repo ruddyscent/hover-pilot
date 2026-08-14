@@ -206,6 +206,11 @@ def load_policy_checkpoint(checkpoint_path: str) -> PPOCheckpoint:
             checkpoint.get("observation_config"),
             str(control_mode),
         ),
+        experiment_metadata=(
+            dict(checkpoint.get("experiment_metadata", {}))
+            if isinstance(checkpoint.get("experiment_metadata", {}), Mapping)
+            else {}
+        ),
     )
 
 
@@ -215,6 +220,7 @@ def build_policy_checkpoint(
     control_mode: str,
     elevator_fixed_throttle: float,
     reward_config: RewardConfig,
+    experiment_metadata: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     """Build the portable, versioned representation of a PPO policy."""
 
@@ -241,5 +247,6 @@ def build_policy_checkpoint(
             reward_config,
             control_mode,
         ),
+        "experiment_metadata": dict(experiment_metadata or {}),
     }
     return checkpoint
