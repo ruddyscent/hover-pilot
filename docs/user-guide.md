@@ -604,6 +604,39 @@ preset and fixed throttle take precedence over their command-line defaults.
 The optimizer is recreated with the command's current learning rate and tuning
 options.
 
+Training saves the latest policy to `--save-path` and evaluates the deterministic
+policy every `--eval-interval-steps` (10,240 by default). When the mean evaluation
+reward improves, it also saves a best checkpoint. The default best path is the
+latest checkpoint name with `.best` inserted before the extension; for example,
+`ppo_hoverpilot.pt` produces `ppo_hoverpilot.best.pt`. Override it with
+`--best-save-path`, or disable periodic evaluation with
+`--eval-interval-steps 0`. Final evaluation still runs when training completes.
+
+Evaluation records mean reward, reward per step, attitude/position/altitude
+errors, simulator-physics survival time, and termination counts in the console
+and TensorBoard.
+
+Evaluate one checkpoint deterministically:
+
+```bash
+uv run hoverpilot-ppo evaluate \
+  --checkpoint ppo_hoverpilot.best.pt \
+  --episodes 10
+```
+
+Compare it with an earlier checkpoint under the same evaluation settings:
+
+```bash
+uv run hoverpilot-ppo evaluate \
+  --checkpoint ppo_hoverpilot.best.pt \
+  --compare-to ppo_hoverpilot_previous.pt \
+  --episodes 10
+```
+
+The comparison reports current-minus-baseline deltas. Positive reward and
+survival-time deltas are improvements; negative position and attitude error
+deltas are improvements.
+
 Run a trained checkpoint against Airplane Hover Trainer:
 
 ```bash
@@ -639,7 +672,8 @@ The task-specific switches include `--control-mode`, `--policy-preset`,
 `--episode-start-idle-throttle`, `--episode-start-idle-curriculum-steps`,
 `--episode-start-idle-curriculum-start-seconds`,
 `--episode-start-handoff-seconds`, `--resume-from`, and
-`--checkpoint-interval-steps`.
+`--checkpoint-interval-steps`, `--eval-interval-steps`, and
+`--best-save-path`.
 
 To disable TensorBoard logging for a run:
 
@@ -684,6 +718,7 @@ Useful TensorBoard scalars include:
   `train/recovery_probe/effective_restoring_fraction`
 - `eval/avg_reward`
 - `eval/reward_per_step`
+- `eval/survival_time_s`
 - `eval/position_error_m`, `eval/altitude_error_m`, `eval/attitude_error_deg`
 - `eval/termination/*`, `eval/termination_rate/*`
 

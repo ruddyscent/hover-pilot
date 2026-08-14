@@ -17,6 +17,7 @@ from .constants import (
     POLICY_PRESET_NONE,
 )
 
+
 @dataclass
 class PPOConfig:
     host: str = HOST
@@ -61,6 +62,8 @@ class PPOConfig:
     rflink_request_attempts: int = 4
     rflink_retry_backoff_s: float = 0.1
     checkpoint_interval_steps: int = 1024
+    eval_interval_steps: int = 10240
+    best_save_path: Optional[str] = None
 
 
 @dataclass

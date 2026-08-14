@@ -18,6 +18,7 @@ from .constants import (
 from .player import PPOPlayer
 from .trainer import PPOTrainer
 
+
 def _add_rflink_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--rflink-socket-timeout-s",
@@ -75,9 +76,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--learning-rate",
         type=float,
         default=None,
-        help=(
-            "Optimizer learning rate. Defaults to 1e-4."
-        ),
+        help=("Optimizer learning rate. Defaults to 1e-4."),
     )
     train_parser.add_argument("--gamma", type=float, default=0.99)
     train_parser.add_argument("--gae-lambda", type=float, default=0.95)
@@ -99,17 +98,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--entropy-coef",
         type=float,
         default=None,
-        help=(
-            "Entropy coefficient. Defaults to 0.0001."
-        ),
+        help=("Entropy coefficient. Defaults to 0.0001."),
     )
     train_parser.add_argument(
         "--policy-initial-std",
         type=float,
         default=None,
-        help=(
-            "Initial policy exploration standard deviation. Defaults to 0.08."
-        ),
+        help=("Initial policy exploration standard deviation. Defaults to 0.08."),
     )
     train_parser.add_argument("--max-grad-norm", type=float, default=0.5)
     train_parser.add_argument("--log-interval", type=int, default=1)
@@ -126,11 +121,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--eval-episodes",
         type=int,
         default=None,
-        help=(
-            "Final evaluation episodes. Defaults to 10."
-        ),
+        help=("Final evaluation episodes. Defaults to 10."),
     )
-    train_parser.add_argument("--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo")
+    train_parser.add_argument(
+        "--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo"
+    )
     train_parser.add_argument("--disable-tensorboard", action="store_true")
     train_parser.add_argument(
         "--control-mode",
@@ -213,6 +208,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Save the current model after this many completed training steps; 0 disables.",
     )
     train_parser.add_argument(
+        "--eval-interval-steps",
+        type=int,
+        default=10240,
+        help="Run deterministic evaluation every N training steps; 0 disables periodic evaluation.",
+    )
+    train_parser.add_argument(
+        "--best-save-path",
+        default=None,
+        help="Best checkpoint path. Defaults to <save-path stem>.best.pt.",
+    )
+    train_parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda", "mps"),
         default="auto",
@@ -259,6 +265,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     _add_rflink_args(play_parser)
 
+    evaluate_parser = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate a checkpoint and optionally compare an earlier checkpoint",
+    )
+    evaluate_parser.add_argument("--checkpoint", required=True)
+    evaluate_parser.add_argument("--compare-to", default=None)
+    evaluate_parser.add_argument("--episodes", type=int, default=10)
+    evaluate_parser.add_argument("--max-episode-steps", type=int, default=300)
+    evaluate_parser.add_argument("--sleep-interval-s", type=float, default=0.0)
+    evaluate_parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda", "mps"), default="auto"
+    )
+    _add_rflink_args(evaluate_parser)
+
     diagnose_parser = subparsers.add_parser(
         "diagnose-elevator",
         help="Measure RealFlight pitch response to conservative elevator pulses",
@@ -300,7 +320,9 @@ def main(argv: Optional[List[str]] = None):
             eval_episodes=args.eval_episodes,
             log_interval=args.log_interval,
             telemetry_log_interval_steps=args.telemetry_log_interval_steps,
-            tensorboard_log_dir=None if args.disable_tensorboard else args.tensorboard_log_dir,
+            tensorboard_log_dir=None
+            if args.disable_tensorboard
+            else args.tensorboard_log_dir,
             device=args.device,
             control_mode=args.control_mode,
             policy_preset=args.policy_preset,
@@ -318,6 +340,8 @@ def main(argv: Optional[List[str]] = None):
             rflink_request_attempts=args.rflink_request_attempts,
             rflink_retry_backoff_s=args.rflink_retry_backoff_s,
             checkpoint_interval_steps=args.checkpoint_interval_steps,
+            eval_interval_steps=args.eval_interval_steps,
+            best_save_path=args.best_save_path,
         )
         trainer = PPOTrainer(config)
         trainer.train()
@@ -338,6 +362,39 @@ def main(argv: Optional[List[str]] = None):
             )
         )
         player.play()
+    elif args.command == "evaluate":
+        if args.episodes <= 0:
+            raise ValueError("--episodes must be greater than zero")
+
+        def evaluate_checkpoint(path: str):
+            evaluator = PPOPlayer(
+                PPOPlayConfig(
+                    checkpoint_path=path,
+                    host=args.host,
+                    port=args.port,
+                    max_episode_steps=args.max_episode_steps,
+                    sleep_interval_s=args.sleep_interval_s,
+                    device=args.device,
+                    episodes=args.episodes,
+                    log_interval_steps=0,
+                    rflink_socket_timeout_s=args.rflink_socket_timeout_s,
+                    rflink_request_attempts=args.rflink_request_attempts,
+                    rflink_retry_backoff_s=args.rflink_retry_backoff_s,
+                )
+            )
+            print(f"[EVAL] checkpoint={path}")
+            return evaluator.evaluate()
+
+        baseline = evaluate_checkpoint(args.compare_to) if args.compare_to else None
+        current = evaluate_checkpoint(args.checkpoint)
+        if baseline is not None:
+            print(
+                "[COMPARE] current-baseline "
+                f"mean_reward={current.mean_reward - baseline.mean_reward:+.3f} "
+                f"survival_time={current.mean_survival_time_s - baseline.mean_survival_time_s:+.3f}s "
+                f"position_error={current.mean_position_error_m - baseline.mean_position_error_m:+.3f}m "
+                f"attitude_error={current.mean_attitude_error_deg - baseline.mean_attitude_error_deg:+.3f}deg"
+            )
     elif args.command == "diagnose-elevator":
         diagnose_elevator_response(
             args.host,
@@ -350,5 +407,7 @@ def main(argv: Optional[List[str]] = None):
             rflink_request_attempts=args.rflink_request_attempts,
             rflink_retry_backoff_s=args.rflink_retry_backoff_s,
         )
+
+
 if __name__ == "__main__":
     main()

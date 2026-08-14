@@ -22,6 +22,7 @@ from .constants import (
     CONTROL_MODE_RUDDER_THROTTLE,
     CONTROL_MODE_THROTTLE,
 )
+from .evaluation import EvaluationAccumulator, EvaluationResult, format_evaluation
 from .models import ActorCritic
 from .runtime import (
     _build_hover_env,
@@ -34,10 +35,13 @@ from .runtime import (
     resolve_device,
 )
 
+
 class PPOPlayer:
     def __init__(self, config: PPOPlayConfig):
         if config.episodes < 0:
-            raise ValueError("episodes must be non-negative; use 0 to run until interrupted")
+            raise ValueError(
+                "episodes must be non-negative; use 0 to run until interrupted"
+            )
         if config.log_interval_steps < 0:
             raise ValueError("log_interval_steps must be non-negative")
         _validate_rflink_settings(config)
@@ -47,9 +51,7 @@ class PPOPlayer:
         checkpoint = load_policy_checkpoint(config.checkpoint_path)
         self.control_mode = checkpoint.control_mode
         self.policy_preset = checkpoint.policy_preset
-        self.elevator_fixed_throttle = (
-            checkpoint.elevator_fixed_throttle
-        )
+        self.elevator_fixed_throttle = checkpoint.elevator_fixed_throttle
         self.reward_config = _apply_observation_config(
             RewardConfig(),
             checkpoint.observation_config,
@@ -152,11 +154,16 @@ class PPOPlayer:
     def play(self):
         completed_episodes = 0
         total_steps = 0
-        checkpoint_path = os.path.abspath(os.path.expanduser(self.config.checkpoint_path))
-        episode_limit = "unlimited" if self.config.episodes == 0 else str(self.config.episodes)
+        checkpoint_path = os.path.abspath(
+            os.path.expanduser(self.config.checkpoint_path)
+        )
+        episode_limit = (
+            "unlimited" if self.config.episodes == 0 else str(self.config.episodes)
+        )
         throttle_description = (
             "throttle=policy"
-            if self.control_mode in {
+            if self.control_mode
+            in {
                 CONTROL_MODE_ALL,
                 CONTROL_MODE_THROTTLE,
                 CONTROL_MODE_ELEVATOR_THROTTLE,
@@ -174,7 +181,9 @@ class PPOPlayer:
 
         try:
             next_segment = None
-            while self.config.episodes == 0 or completed_episodes < self.config.episodes:
+            while (
+                self.config.episodes == 0 or completed_episodes < self.config.episodes
+            ):
                 if next_segment is None:
                     observation, info = reset_env_with_wait(
                         self.env,
@@ -201,7 +210,9 @@ class PPOPlayer:
                         action_tensor = self.model.deterministic_action(obs_tensor)
                     policy_action = action_tensor.squeeze(0).cpu().numpy()
                     env_action = self._to_env_action(policy_action)
-                    observation, reward, terminated, truncated, info = self.env.step(env_action)
+                    observation, reward, terminated, truncated, info = self.env.step(
+                        env_action
+                    )
                     total_steps += 1
                     episode_steps += 1
                     episode_reward += float(reward)
@@ -234,6 +245,65 @@ class PPOPlayer:
                             next_segment = continue_env_after_truncation(self.env)
                         break
         except KeyboardInterrupt:
-            print(f"\n[PLAY] Interrupted after episodes={completed_episodes} steps={total_steps}")
+            print(
+                f"\n[PLAY] Interrupted after episodes={completed_episodes} steps={total_steps}"
+            )
+        finally:
+            self.env.close()
+
+    def evaluate(self) -> EvaluationResult:
+        """Run deterministic episodes and return comparable hover metrics."""
+
+        if self.config.episodes <= 0:
+            raise ValueError("evaluation requires a positive episode count")
+        accumulator = EvaluationAccumulator(self.control_mode)
+        next_segment = None
+        try:
+            for _ in range(self.config.episodes):
+                if next_segment is None:
+                    observation, _ = reset_env_with_wait(
+                        self.env,
+                        action=self._wait_action(),
+                        initial_action=self._initial_action(),
+                    )
+                else:
+                    observation, _ = next_segment
+                    next_segment = None
+                episode_reward = 0.0
+                episode_steps = 0
+                while True:
+                    observation_tensor = torch.as_tensor(
+                        observation, dtype=torch.float32, device=self.device
+                    ).unsqueeze(0)
+                    with torch.inference_mode():
+                        policy_action = (
+                            self.model.deterministic_action(observation_tensor)
+                            .squeeze(0)
+                            .cpu()
+                            .numpy()
+                        )
+                    observation, reward, terminated, truncated, info = self.env.step(
+                        self._to_env_action(policy_action)
+                    )
+                    episode_reward += float(reward)
+                    episode_steps += 1
+                    accumulator.record_step(info)
+                    if terminated or truncated:
+                        reason = info.get("termination_reason") or (
+                            "truncated" if truncated else "unknown"
+                        )
+                        accumulator.finish_episode(
+                            episode_reward, episode_steps, str(reason)
+                        )
+                        if (
+                            truncated
+                            and self.control_mode
+                            not in CONNECTION_EPISODE_CONTROL_MODES
+                        ):
+                            next_segment = continue_env_after_truncation(self.env)
+                        break
+            result = accumulator.result()
+            print(f"[EVAL] {format_evaluation(result)}")
+            return result
         finally:
             self.env.close()

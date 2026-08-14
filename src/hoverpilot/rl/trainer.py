@@ -68,6 +68,7 @@ from .runtime import (
     resolve_device,
 )
 
+
 class PPOTrainer:
     def __init__(self, config: PPOConfig):
         config = _resolve_training_defaults(config)
@@ -90,6 +91,8 @@ class PPOTrainer:
         _validate_rflink_settings(config)
         if config.checkpoint_interval_steps < 0:
             raise ValueError("checkpoint_interval_steps must be non-negative")
+        if config.eval_interval_steps < 0:
+            raise ValueError("eval_interval_steps must be non-negative")
         if config.telemetry_log_interval_steps < 0:
             raise ValueError("telemetry_log_interval_steps must be non-negative")
         if (
@@ -100,13 +103,9 @@ class PPOTrainer:
                 "episode_start_idle_seconds must be a finite non-negative value"
             )
         if config.episode_start_idle_curriculum_steps < 0:
-            raise ValueError(
-                "episode_start_idle_curriculum_steps must be non-negative"
-            )
+            raise ValueError("episode_start_idle_curriculum_steps must be non-negative")
         if (
-            not math.isfinite(
-                config.episode_start_idle_curriculum_start_seconds
-            )
+            not math.isfinite(config.episode_start_idle_curriculum_start_seconds)
             or config.episode_start_idle_curriculum_start_seconds < 0.0
             or config.episode_start_idle_curriculum_start_seconds
             > config.episode_start_idle_seconds
@@ -147,9 +146,7 @@ class PPOTrainer:
                     f"{config.control_mode!r} was requested"
                 )
             self.policy_preset = resume_checkpoint.policy_preset
-            self.elevator_fixed_throttle = (
-                resume_checkpoint.elevator_fixed_throttle
-            )
+            self.elevator_fixed_throttle = resume_checkpoint.elevator_fixed_throttle
         else:
             self.policy_preset = _validate_policy_preset(
                 config.policy_preset,
@@ -191,14 +188,14 @@ class PPOTrainer:
             self._load_resume_checkpoint(resume_checkpoint, config.resume_from)
             if config.policy_initial_std is not None:
                 with torch.no_grad():
-                    self.model.policy_log_std.fill_(
-                        math.log(config.policy_initial_std)
-                    )
+                    self.model.policy_log_std.fill_(math.log(config.policy_initial_std))
                 print(
                     "[PPO] Overrode resumed policy exploration std with "
                     f"{config.policy_initial_std}"
                 )
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate)
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=config.learning_rate
+        )
         self.writer = self._build_writer()
         self._curriculum_exposure_steps = 0
         self._evaluating = False
@@ -272,12 +269,11 @@ class PPOTrainer:
             self._curriculum_exposure_steps
             / self.config.episode_start_idle_curriculum_steps,
         )
-        start_seconds = (
-            self.config.episode_start_idle_curriculum_start_seconds
+        start_seconds = self.config.episode_start_idle_curriculum_start_seconds
+        return (
+            start_seconds
+            + (self.config.episode_start_idle_seconds - start_seconds) * progress
         )
-        return start_seconds + (
-            self.config.episode_start_idle_seconds - start_seconds
-        ) * progress
 
     def _deterministic_env_action(self, observation: np.ndarray) -> np.ndarray:
         observation_tensor = torch.as_tensor(
@@ -286,12 +282,10 @@ class PPOTrainer:
             device=self.device,
         ).unsqueeze(0)
         with torch.no_grad():
-            policy_action = self.model.deterministic_action(
-                observation_tensor
-            ).squeeze(0)
-        normalized_action = self._normalize_action(
-            policy_action.cpu().numpy()
-        )
+            policy_action = self.model.deterministic_action(observation_tensor).squeeze(
+                0
+            )
+        normalized_action = self._normalize_action(policy_action.cpu().numpy())
         return self._to_env_action(normalized_action)
 
     def _apply_episode_start_idle(
@@ -325,9 +319,7 @@ class PPOTrainer:
         handoff_duration_s = self.config.episode_start_handoff_seconds
         run_handoff = getattr(self.env, "run_episode_start_handoff", None)
         if not callable(run_handoff):
-            raise RuntimeError(
-                "environment does not support an episode start handoff"
-            )
+            raise RuntimeError("environment does not support an episode start handoff")
         started, observation, info = run_handoff(
             duration_s=handoff_duration_s,
             start_action=self._episode_start_idle_action(),
@@ -349,8 +341,7 @@ class PPOTrainer:
         require_reset_boundary: bool = False,
     ) -> Tuple[np.ndarray, dict[str, object]]:
         require_reset_boundary = (
-            require_reset_boundary
-            or self.config.episode_start_idle_seconds > 0.0
+            require_reset_boundary or self.config.episode_start_idle_seconds > 0.0
         )
         while True:
             observation, info = reset_env_with_wait(
@@ -384,10 +375,7 @@ class PPOTrainer:
         self,
         successful_steps: int,
     ) -> None:
-        if (
-            self._evaluating
-            or self.config.episode_start_idle_curriculum_steps == 0
-        ):
+        if self._evaluating or self.config.episode_start_idle_curriculum_steps == 0:
             return
         self._curriculum_exposure_steps += successful_steps
 
@@ -399,9 +387,7 @@ class PPOTrainer:
         if not isinstance(debug_state, Mapping):
             return False
         try:
-            radial_distance_m = float(
-                debug_state["distance_from_cylinder_axis_m"]
-            )
+            radial_distance_m = float(debug_state["distance_from_cylinder_axis_m"])
             horizontal_speed_mps = math.hypot(
                 float(debug_state["velocity_world_u_mps"]),
                 float(debug_state["velocity_world_v_mps"]),
@@ -411,21 +397,16 @@ class PPOTrainer:
                 - self.env.reward_config.target_altitude_agl_m
             )
             tilt_error_deg = abs(
-                float(debug_state["inclination_deg"])
-                - HOVER_TARGET_INCLINATION_DEG
+                float(debug_state["inclination_deg"]) - HOVER_TARGET_INCLINATION_DEG
             )
         except (KeyError, TypeError, ValueError):
             return False
         reward_config = self.env.reward_config
         return (
-            radial_distance_m
-            <= reward_config.trainer_cylinder_radius_m / 3.0
-            and horizontal_speed_mps
-            <= reward_config.velocity_error_scale_mps * 0.3
-            and altitude_error_m
-            <= reward_config.altitude_error_scale_m / 3.0
-            and tilt_error_deg
-            <= reward_config.inclination_error_scale_deg
+            radial_distance_m <= reward_config.trainer_cylinder_radius_m / 3.0
+            and horizontal_speed_mps <= reward_config.velocity_error_scale_mps * 0.3
+            and altitude_error_m <= reward_config.altitude_error_scale_m / 3.0
+            and tilt_error_deg <= reward_config.inclination_error_scale_deg
         )
 
     def _policy_action_labels(self) -> tuple[str, ...]:
@@ -498,7 +479,8 @@ class PPOTrainer:
 
     def _write_elevator_recovery_probe(self, step: int):
         if (
-            self.config.control_mode not in {
+            self.config.control_mode
+            not in {
                 CONTROL_MODE_ELEVATOR,
                 CONTROL_MODE_ELEVATOR_THROTTLE,
             }
@@ -589,8 +571,7 @@ class PPOTrainer:
         minimum_restoring_margin = float(np.min(restoring_margins))
         restoring_fraction = float(
             np.mean(
-                np.asarray(restoring_margins)
-                >= _ELEVATOR_EFFECTIVE_RESTORING_ACTION
+                np.asarray(restoring_margins) >= _ELEVATOR_EFFECTIVE_RESTORING_ACTION
             )
         )
         print(
@@ -623,10 +604,7 @@ class PPOTrainer:
         }:
             return
         expected_shape = (
-            (4,)
-            if self.config.control_mode
-            == CONTROL_MODE_AILERON_THROTTLE
-            else (2,)
+            (4,) if self.config.control_mode == CONTROL_MODE_AILERON_THROTTLE else (2,)
         )
         if self.env.observation_space.shape != expected_shape:
             return
@@ -642,15 +620,10 @@ class PPOTrainer:
         )
         with torch.no_grad():
             latent_means = (
-                self.model._compute_policy_mean(probe)[:, 0]
-                .detach()
-                .cpu()
-                .numpy()
+                self.model._compute_policy_mean(probe)[:, 0].detach().cpu().numpy()
             )
         assert self.model.aileron_policy_trim_latent is not None
-        trim_latent = float(
-            self.model.aileron_policy_trim_latent.detach().cpu().item()
-        )
+        trim_latent = float(self.model.aileron_policy_trim_latent.detach().cpu().item())
         corrections = latent_means - trim_latent
         restoring_margins = np.asarray(
             [
@@ -701,9 +674,7 @@ class PPOTrainer:
         }:
             return
         expected_shape = (
-            (4,)
-            if self.config.control_mode == CONTROL_MODE_RUDDER_THROTTLE
-            else (2,)
+            (4,) if self.config.control_mode == CONTROL_MODE_RUDDER_THROTTLE else (2,)
         )
         if self.env.observation_space.shape != expected_shape:
             return
@@ -719,10 +690,7 @@ class PPOTrainer:
         )
         with torch.no_grad():
             corrections = (
-                self.model._compute_policy_mean(probe)[:, 0]
-                .detach()
-                .cpu()
-                .numpy()
+                self.model._compute_policy_mean(probe)[:, 0].detach().cpu().numpy()
             )
         restoring_margins = np.asarray(
             [
@@ -793,9 +761,7 @@ class PPOTrainer:
         )
         with torch.no_grad():
             latent_means = (
-                self.model._compute_policy_mean(probe)[
-                    :, throttle_action_index
-                ]
+                self.model._compute_policy_mean(probe)[:, throttle_action_index]
                 .detach()
                 .cpu()
                 .numpy()
@@ -823,9 +789,7 @@ class PPOTrainer:
         )
         minimum_margin = float(restoring_margins.min())
         assert self.model.throttle_policy_trim is not None
-        trim = float(
-            self.model.throttle_policy_trim.detach().cpu().item()
-        )
+        trim = float(self.model.throttle_policy_trim.detach().cpu().item())
         print(
             "[PPO] throttle recovery probe "
             f"trim={trim:.3f} "
@@ -870,7 +834,9 @@ class PPOTrainer:
         total = max(1, len(termination_reasons))
         for reason, count in counts.items():
             self._write_scalar(f"train/termination/{reason}", float(count), step)
-            self._write_scalar(f"train/termination_rate/{reason}", float(count) / total, step)
+            self._write_scalar(
+                f"train/termination_rate/{reason}", float(count) / total, step
+            )
 
     def _format_reward_breakdown(self, info: Optional[Dict]) -> str:
         if not info:
@@ -897,9 +863,7 @@ class PPOTrainer:
             info.get("episode_start_idle") if isinstance(info, dict) else None
         )
         episode_start_handoff = (
-            info.get("episode_start_handoff")
-            if isinstance(info, dict)
-            else None
+            info.get("episode_start_handoff") if isinstance(info, dict) else None
         )
         print(
             f"[PPO] episode start reason={info.get('episode_start_reason')} "
@@ -960,12 +924,8 @@ class PPOTrainer:
             features = info.get("throttle_hover_features", {})
             if not features:
                 return
-            altitude_error = float(
-                features.get("altitude_error_m", 0.0)
-            )
-            vertical_velocity = float(
-                features.get("vertical_velocity_mps", 0.0)
-            )
+            altitude_error = float(features.get("altitude_error_m", 0.0))
+            vertical_velocity = float(features.get("vertical_velocity_mps", 0.0))
             throttle = float(env_action[2])
             gains_tensor = self.model.throttle_policy_gain
             gains = (
@@ -988,8 +948,7 @@ class PPOTrainer:
                 / self.env.reward_config.velocity_error_scale_mps
             )
             restoring = (
-                abs(weighted_error) < 1.0e-3
-                or (throttle - trim) * weighted_error < 0.0
+                abs(weighted_error) < 1.0e-3 or (throttle - trim) * weighted_error < 0.0
             )
             print(
                 f"[PPO] control step={total_steps} reward={reward:+.3f} "
@@ -1031,9 +990,7 @@ class PPOTrainer:
             features = info.get("rudder_hover_features", {})
             if not features:
                 return
-            rudder_angle_error = float(
-                features.get("rudder_angle_error_deg", 0.0)
-            )
+            rudder_angle_error = float(features.get("rudder_angle_error_deg", 0.0))
             yaw_rate = float(features.get("yaw_rate_deg_s", 0.0))
             rudder = float(env_action[3])
             gains_tensor = self.model.rudder_policy_gain
@@ -1050,14 +1007,8 @@ class PPOTrainer:
                 * yaw_rate
                 / self.env.reward_config.yaw_rate_scale_deg_s
             )
-            restoring = (
-                abs(weighted_error) < 1.0e-3
-                or rudder * weighted_error > 0.0
-            )
-            combined_mode = (
-                self.config.control_mode
-                == CONTROL_MODE_RUDDER_THROTTLE
-            )
+            restoring = abs(weighted_error) < 1.0e-3 or rudder * weighted_error > 0.0
+            combined_mode = self.config.control_mode == CONTROL_MODE_RUDDER_THROTTLE
             throttle_description = ""
             throttle_restoring = True
             if combined_mode:
@@ -1065,9 +1016,7 @@ class PPOTrainer:
                     "throttle_hover_features",
                     {},
                 )
-                altitude_error = float(
-                    throttle_features.get("altitude_error_m", 0.0)
-                )
+                altitude_error = float(throttle_features.get("altitude_error_m", 0.0))
                 vertical_velocity = float(
                     throttle_features.get("vertical_velocity_mps", 0.0)
                 )
@@ -1076,12 +1025,8 @@ class PPOTrainer:
                 throttle_trim = self.model.throttle_policy_trim
                 assert throttle_gains is not None
                 assert throttle_trim is not None
-                throttle_gain_values = (
-                    throttle_gains.detach().cpu().numpy()
-                )
-                throttle_trim_value = float(
-                    throttle_trim.detach().cpu().item()
-                )
+                throttle_gain_values = throttle_gains.detach().cpu().numpy()
+                throttle_trim_value = float(throttle_trim.detach().cpu().item())
                 throttle_weighted_error = (
                     float(throttle_gain_values[0])
                     * altitude_error
@@ -1092,11 +1037,7 @@ class PPOTrainer:
                 )
                 throttle_restoring = (
                     abs(throttle_weighted_error) < 1.0e-3
-                    or (
-                        throttle - throttle_trim_value
-                    )
-                    * throttle_weighted_error
-                    < 0.0
+                    or (throttle - throttle_trim_value) * throttle_weighted_error < 0.0
                 )
                 throttle_description = (
                     f" throttle={throttle:.3f}"
@@ -1167,10 +1108,7 @@ class PPOTrainer:
             features = info.get("aileron_hover_features", {})
             if not features:
                 return
-            combined_mode = (
-                self.config.control_mode
-                == CONTROL_MODE_AILERON_THROTTLE
-            )
+            combined_mode = self.config.control_mode == CONTROL_MODE_AILERON_THROTTLE
             roll_error = float(features.get("roll_error_deg", 0.0))
             roll_rate = float(features.get("roll_rate_deg_s", 0.0))
             aileron = float(env_action[0])
@@ -1196,8 +1134,7 @@ class PPOTrainer:
                 / self.env.reward_config.roll_rate_scale_deg_s
             )
             aileron_restoring = (
-                abs(weighted_error) < 1.0e-3
-                or correction * weighted_error < 0.0
+                abs(weighted_error) < 1.0e-3 or correction * weighted_error < 0.0
             )
             throttle_description = ""
             throttle_restoring = True
@@ -1206,9 +1143,7 @@ class PPOTrainer:
                     "throttle_hover_features",
                     {},
                 )
-                altitude_error = float(
-                    throttle_features.get("altitude_error_m", 0.0)
-                )
+                altitude_error = float(throttle_features.get("altitude_error_m", 0.0))
                 vertical_velocity = float(
                     throttle_features.get(
                         "vertical_velocity_mps",
@@ -1220,12 +1155,8 @@ class PPOTrainer:
                 throttle_trim = self.model.throttle_policy_trim
                 assert throttle_gains is not None
                 assert throttle_trim is not None
-                throttle_gain_values = (
-                    throttle_gains.detach().cpu().numpy()
-                )
-                throttle_trim_value = float(
-                    throttle_trim.detach().cpu().item()
-                )
+                throttle_gain_values = throttle_gains.detach().cpu().numpy()
+                throttle_trim_value = float(throttle_trim.detach().cpu().item())
                 throttle_weighted_error = (
                     float(throttle_gain_values[0])
                     * altitude_error
@@ -1236,11 +1167,7 @@ class PPOTrainer:
                 )
                 throttle_restoring = (
                     abs(throttle_weighted_error) < 1.0e-3
-                    or (
-                        throttle - throttle_trim_value
-                    )
-                    * throttle_weighted_error
-                    < 0.0
+                    or (throttle - throttle_trim_value) * throttle_weighted_error < 0.0
                 )
                 throttle_description = (
                     f" throttle={throttle:.3f}"
@@ -1310,26 +1237,13 @@ class PPOTrainer:
             return
         inclination_error = float(features.get("inclination_error_deg", 0.0))
         pitch_rate = float(features.get("pitch_rate_deg_s", 0.0))
-        longitudinal_error = float(
-            features.get("longitudinal_position_error_m", 0.0)
-        )
-        longitudinal_velocity = float(
-            features.get("longitudinal_velocity_mps", 0.0)
-        )
-        combined_mode = (
-            self.config.control_mode
-            == CONTROL_MODE_ELEVATOR_THROTTLE
-        )
+        longitudinal_error = float(features.get("longitudinal_position_error_m", 0.0))
+        longitudinal_velocity = float(features.get("longitudinal_velocity_mps", 0.0))
+        combined_mode = self.config.control_mode == CONTROL_MODE_ELEVATOR_THROTTLE
         altitude_error = float(features.get("altitude_error_m", 0.0))
-        upward_velocity = -float(
-            features.get("vertical_velocity_mps", 0.0)
-        )
-        target_inclination_error = float(
-            info.get("elevator_recovery_target_deg", 0.0)
-        )
-        inclination_tracking_error = (
-            inclination_error - target_inclination_error
-        )
+        upward_velocity = -float(features.get("vertical_velocity_mps", 0.0))
+        target_inclination_error = float(info.get("elevator_recovery_target_deg", 0.0))
+        inclination_tracking_error = inclination_error - target_inclination_error
         radial_distance = float(
             info.get("debug_state", {}).get(
                 "distance_from_cylinder_axis_m",
@@ -1452,9 +1366,13 @@ class PPOTrainer:
             return
         action_array = np.asarray(actions, dtype=np.float32)
         termination_counts = Counter(termination_reasons)
-        reason_summary = ", ".join(
-            f"{reason}:{count}" for reason, count in sorted(termination_counts.items())
-        ) or "none"
+        reason_summary = (
+            ", ".join(
+                f"{reason}:{count}"
+                for reason, count in sorted(termination_counts.items())
+            )
+            or "none"
+        )
         print(
             f"[PPO] rollout steps={total_steps}/{self.config.timesteps} "
             f"samples={rollout.index} reward_mean={np.mean(rewards):+.3f} "
@@ -1513,8 +1431,9 @@ class PPOTrainer:
         high = self.policy_action_space.high
         return np.clip(raw_action, low, high)
 
-    def _save_model(self, *, step: int, reason: str):
-        save_path = os.path.abspath(self.config.save_path)
+    def _save_model(self, *, step: int, reason: str, save_path: Optional[str] = None):
+        requested_path = save_path or self.config.save_path
+        save_path = os.path.abspath(requested_path)
         save_directory = os.path.dirname(save_path)
         os.makedirs(save_directory, exist_ok=True)
         temporary_path = f"{save_path}.tmp-{os.getpid()}"
@@ -1532,7 +1451,7 @@ class PPOTrainer:
         finally:
             if os.path.exists(temporary_path):
                 os.remove(temporary_path)
-        print(f"[PPO] Saved {reason} model at step={step} to {self.config.save_path}")
+        print(f"[PPO] Saved {reason} model at step={step} to {requested_path}")
         self._write_scalar("train/checkpoint_step", float(step), step)
 
     def train(self):
@@ -1540,6 +1459,8 @@ class PPOTrainer:
         last_completed_update_steps = 0
         last_saved_steps = 0
         next_checkpoint_step = self.config.checkpoint_interval_steps
+        next_eval_step = self.config.eval_interval_steps
+        best_mean_reward = -math.inf
         report_every = max(1, self.config.log_interval)
         training_start = time.time()
         episode_rewards = []
@@ -1583,6 +1504,8 @@ class PPOTrainer:
                         f"rflink_request_attempts={self.config.rflink_request_attempts}",
                         f"rflink_retry_backoff_s={self.config.rflink_retry_backoff_s}",
                         f"checkpoint_interval_steps={self.config.checkpoint_interval_steps}",
+                        f"eval_interval_steps={self.config.eval_interval_steps}",
+                        f"best_save_path={self.config.best_save_path}",
                         f"telemetry_log_interval_steps={self.config.telemetry_log_interval_steps}",
                         f"max_episode_steps={self.config.max_episode_steps}",
                         f"seed={self.config.seed}",
@@ -1608,16 +1531,25 @@ class PPOTrainer:
                 rollout_rewards: list[float] = []
                 rollout_termination_reasons: list[str] = []
                 for _ in range(self.config.n_steps):
-                    obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
-                    action_tensor, log_prob_tensor, value_tensor = self.model.get_action(obs_tensor)
+                    obs_tensor = torch.as_tensor(
+                        observation, dtype=torch.float32, device=self.device
+                    ).unsqueeze(0)
+                    action_tensor, log_prob_tensor, value_tensor = (
+                        self.model.get_action(obs_tensor)
+                    )
                     action = action_tensor.squeeze(0).detach().cpu().numpy()
                     executed_action = self._normalize_action(action)
                     env_action = self._to_env_action(executed_action)
-                    next_obs, reward, terminated, truncated, info = self.env.step(env_action)
+                    next_obs, reward, terminated, truncated, info = self.env.step(
+                        env_action
+                    )
                     episode_boundary = bool(terminated or truncated)
                     rollout_actions.append(executed_action.copy())
                     rollout_rewards.append(float(reward))
-                    rollout_termination_reasons.append(info.get("termination_reason") or ("truncated" if truncated else "incomplete"))
+                    rollout_termination_reasons.append(
+                        info.get("termination_reason")
+                        or ("truncated" if truncated else "incomplete")
+                    )
                     rollout.add(
                         observation,
                         executed_action,
@@ -1631,7 +1563,8 @@ class PPOTrainer:
                     observation = next_obs
                     total_steps += 1
                     if (
-                        self.config.control_mode in {
+                        self.config.control_mode
+                        in {
                             CONTROL_MODE_ALL,
                             CONTROL_MODE_AILERON,
                             CONTROL_MODE_ELEVATOR,
@@ -1641,8 +1574,7 @@ class PPOTrainer:
                             CONTROL_MODE_AILERON_THROTTLE,
                             CONTROL_MODE_RUDDER_THROTTLE,
                         }
-                        and
-                        self.config.telemetry_log_interval_steps > 0
+                        and self.config.telemetry_log_interval_steps > 0
                         and total_steps % self.config.telemetry_log_interval_steps == 0
                     ):
                         self._log_control_telemetry(
@@ -1654,13 +1586,9 @@ class PPOTrainer:
                     if episode_boundary:
                         if (
                             truncated
-                            and self._episode_qualifies_for_curriculum_progress(
-                                info
-                            )
+                            and self._episode_qualifies_for_curriculum_progress(info)
                         ):
-                            self._advance_episode_start_idle_curriculum(
-                                episode_length
-                            )
+                            self._advance_episode_start_idle_curriculum(episode_length)
                         episode_info = dict(info)
                         if truncated and not episode_info.get("termination_reason"):
                             episode_info["termination_reason"] = "truncated"
@@ -1669,8 +1597,12 @@ class PPOTrainer:
                             episode_reward=episode_reward,
                             info=episode_info,
                         )
-                        self._write_scalar("train/episode_reward", float(episode_reward), total_steps)
-                        self._write_scalar("train/episode_length", float(episode_length), total_steps)
+                        self._write_scalar(
+                            "train/episode_reward", float(episode_reward), total_steps
+                        )
+                        self._write_scalar(
+                            "train/episode_length", float(episode_length), total_steps
+                        )
                         episode_rewards.append(episode_reward)
                         episode_lengths.append(episode_length)
                         if terminated:
@@ -1683,8 +1615,14 @@ class PPOTrainer:
                     if total_steps >= self.config.timesteps:
                         break
 
-                last_value = self.model(torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0))[2].item()
-                rollout.compute_returns_and_advantages(last_value, self.config.gamma, self.config.gae_lambda)
+                last_value = self.model(
+                    torch.as_tensor(
+                        observation, dtype=torch.float32, device=self.device
+                    ).unsqueeze(0)
+                )[2].item()
+                rollout.compute_returns_and_advantages(
+                    last_value, self.config.gamma, self.config.gae_lambda
+                )
                 advantages = rollout.normalize_advantages()
                 returns = rollout.returns[: rollout.index]
 
@@ -1698,9 +1636,15 @@ class PPOTrainer:
                 )
 
                 action_array = np.asarray(rollout_actions, dtype=np.float32)
-                self._write_scalar("train/reward_mean", float(np.mean(rollout_rewards)), total_steps)
-                self._write_scalar("train/reward_min", float(np.min(rollout_rewards)), total_steps)
-                self._write_scalar("train/reward_max", float(np.max(rollout_rewards)), total_steps)
+                self._write_scalar(
+                    "train/reward_mean", float(np.mean(rollout_rewards)), total_steps
+                )
+                self._write_scalar(
+                    "train/reward_min", float(np.min(rollout_rewards)), total_steps
+                )
+                self._write_scalar(
+                    "train/reward_max", float(np.max(rollout_rewards)), total_steps
+                )
                 self._write_scalar(
                     "train/optimization_reward_mean",
                     float(np.mean(rollout_rewards) * self.config.reward_scale),
@@ -1708,15 +1652,36 @@ class PPOTrainer:
                 )
                 self._write_scalar(
                     "train/done_rate",
-                    float(sum(1 for reason in rollout_termination_reasons if reason != "incomplete") / max(1, rollout.index)),
+                    float(
+                        sum(
+                            1
+                            for reason in rollout_termination_reasons
+                            if reason != "incomplete"
+                        )
+                        / max(1, rollout.index)
+                    ),
                     total_steps,
                 )
-                self._write_scalar("train/return_mean", float(returns.mean().item()), total_steps)
-                self._write_scalar("train/return_std", float(returns.std(unbiased=False).item()), total_steps)
-                self._write_scalar("train/advantage_mean", float(advantages.mean().item()), total_steps)
-                self._write_scalar("train/advantage_std", float(advantages.std(unbiased=False).item()), total_steps)
+                self._write_scalar(
+                    "train/return_mean", float(returns.mean().item()), total_steps
+                )
+                self._write_scalar(
+                    "train/return_std",
+                    float(returns.std(unbiased=False).item()),
+                    total_steps,
+                )
+                self._write_scalar(
+                    "train/advantage_mean", float(advantages.mean().item()), total_steps
+                )
+                self._write_scalar(
+                    "train/advantage_std",
+                    float(advantages.std(unbiased=False).item()),
+                    total_steps,
+                )
                 self._write_action_metrics(action_array, total_steps)
-                self._write_termination_metrics(rollout_termination_reasons, total_steps)
+                self._write_termination_metrics(
+                    rollout_termination_reasons, total_steps
+                )
 
                 policy_losses = []
                 value_losses = []
@@ -1728,13 +1693,26 @@ class PPOTrainer:
                 stopped_for_kl = False
                 for epoch in range(self.config.epochs):
                     epoch_kl_values = []
-                    for batch_obs, batch_actions, batch_old_log_probs, batch_advantages, batch_returns in rollout.get_batches(self.config.batch_size):
-                        batch_log_probs, batch_entropy, batch_values, _ = self.model.evaluate_actions(batch_obs, batch_actions)
+                    for (
+                        batch_obs,
+                        batch_actions,
+                        batch_old_log_probs,
+                        batch_advantages,
+                        batch_returns,
+                    ) in rollout.get_batches(self.config.batch_size):
+                        batch_log_probs, batch_entropy, batch_values, _ = (
+                            self.model.evaluate_actions(batch_obs, batch_actions)
+                        )
                         ratio = torch.exp(batch_log_probs - batch_old_log_probs)
                         log_ratio = batch_log_probs - batch_old_log_probs
                         if epoch == 0 and not policy_losses:
-                            initial_ratio_deviation = float(torch.max(torch.abs(ratio - 1.0)).item())
-                            if not math.isfinite(initial_ratio_deviation) or initial_ratio_deviation > 1.0e-3:
+                            initial_ratio_deviation = float(
+                                torch.max(torch.abs(ratio - 1.0)).item()
+                            )
+                            if (
+                                not math.isfinite(initial_ratio_deviation)
+                                or initial_ratio_deviation > 1.0e-3
+                            ):
                                 raise RuntimeError(
                                     "PPO action/log-prob mismatch before the first optimizer step: "
                                     f"max ratio deviation={initial_ratio_deviation:.6g}"
@@ -1745,14 +1723,26 @@ class PPOTrainer:
                                 total_steps,
                             )
                         surrogate1 = ratio * batch_advantages
-                        surrogate2 = torch.clamp(ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon) * batch_advantages
+                        surrogate2 = (
+                            torch.clamp(
+                                ratio,
+                                1.0 - self.config.clip_epsilon,
+                                1.0 + self.config.clip_epsilon,
+                            )
+                            * batch_advantages
+                        )
                         policy_loss = -torch.min(surrogate1, surrogate2).mean()
-                        value_loss = self.config.value_coef * (batch_returns - batch_values).pow(2).mean()
+                        value_loss = (
+                            self.config.value_coef
+                            * (batch_returns - batch_values).pow(2).mean()
+                        )
                         entropy_loss = -self.entropy_coef * batch_entropy.mean()
                         loss = policy_loss + value_loss + entropy_loss
                         self.optimizer.zero_grad()
                         loss.backward()
-                        nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                        nn.utils.clip_grad_norm_(
+                            self.model.parameters(), self.config.max_grad_norm
+                        )
                         self.optimizer.step()
                         policy_losses.append(float(policy_loss.item()))
                         value_losses.append(float(value_loss.item()))
@@ -1762,7 +1752,12 @@ class PPOTrainer:
                         approx_kl_values.append(approx_kl)
                         epoch_kl_values.append(approx_kl)
                         clip_fraction_values.append(
-                            float((torch.abs(ratio - 1.0) > self.config.clip_epsilon).float().mean().item())
+                            float(
+                                (torch.abs(ratio - 1.0) > self.config.clip_epsilon)
+                                .float()
+                                .mean()
+                                .item()
+                            )
                         )
                     epochs_completed = epoch + 1
                     if (
@@ -1786,16 +1781,38 @@ class PPOTrainer:
                     returns=returns,
                     advantages=advantages,
                 )
-                self._write_scalar("train/policy_loss", float(np.mean(policy_losses)), total_steps)
-                self._write_scalar("train/value_loss", float(np.mean(value_losses)), total_steps)
-                self._write_scalar("train/entropy", float(np.mean(entropy_values)), total_steps)
-                self._write_scalar("train/ratio", float(np.mean(ratio_values)), total_steps)
-                self._write_scalar("train/ratio_min", float(np.min(ratio_values)), total_steps)
-                self._write_scalar("train/ratio_max", float(np.max(ratio_values)), total_steps)
-                self._write_scalar("train/approx_kl", float(np.mean(approx_kl_values)), total_steps)
-                self._write_scalar("train/clip_fraction", float(np.mean(clip_fraction_values)), total_steps)
-                self._write_scalar("train/update_epochs", float(epochs_completed), total_steps)
-                self._write_scalar("train/kl_early_stop", float(stopped_for_kl), total_steps)
+                self._write_scalar(
+                    "train/policy_loss", float(np.mean(policy_losses)), total_steps
+                )
+                self._write_scalar(
+                    "train/value_loss", float(np.mean(value_losses)), total_steps
+                )
+                self._write_scalar(
+                    "train/entropy", float(np.mean(entropy_values)), total_steps
+                )
+                self._write_scalar(
+                    "train/ratio", float(np.mean(ratio_values)), total_steps
+                )
+                self._write_scalar(
+                    "train/ratio_min", float(np.min(ratio_values)), total_steps
+                )
+                self._write_scalar(
+                    "train/ratio_max", float(np.max(ratio_values)), total_steps
+                )
+                self._write_scalar(
+                    "train/approx_kl", float(np.mean(approx_kl_values)), total_steps
+                )
+                self._write_scalar(
+                    "train/clip_fraction",
+                    float(np.mean(clip_fraction_values)),
+                    total_steps,
+                )
+                self._write_scalar(
+                    "train/update_epochs", float(epochs_completed), total_steps
+                )
+                self._write_scalar(
+                    "train/kl_early_stop", float(stopped_for_kl), total_steps
+                )
                 self._write_aileron_recovery_probe(total_steps)
                 self._write_elevator_recovery_probe(total_steps)
                 self._write_rudder_recovery_probe(total_steps)
@@ -1807,18 +1824,25 @@ class PPOTrainer:
                 return_variance = returns.var(unbiased=False)
                 if float(return_variance.item()) > 1.0e-8:
                     explained_variance = 1.0 - (
-                        (returns - post_update_values).var(unbiased=False) / return_variance
+                        (returns - post_update_values).var(unbiased=False)
+                        / return_variance
                     )
                     explained_variance_value = float(explained_variance.item())
                 else:
                     explained_variance_value = 0.0
-                self._write_scalar("train/value_mean", float(post_update_values.mean().item()), total_steps)
+                self._write_scalar(
+                    "train/value_mean",
+                    float(post_update_values.mean().item()),
+                    total_steps,
+                )
                 self._write_scalar(
                     "train/value_std",
                     float(post_update_values.std(unbiased=False).item()),
                     total_steps,
                 )
-                self._write_scalar("train/explained_variance", explained_variance_value, total_steps)
+                self._write_scalar(
+                    "train/explained_variance", explained_variance_value, total_steps
+                )
                 last_completed_update_steps = total_steps
 
                 if (
@@ -1830,6 +1854,30 @@ class PPOTrainer:
                     last_saved_steps = total_steps
                     while next_checkpoint_step <= total_steps:
                         next_checkpoint_step += self.config.checkpoint_interval_steps
+
+                if (
+                    self.config.eval_interval_steps > 0
+                    and total_steps >= next_eval_step
+                    and total_steps < self.config.timesteps
+                ):
+                    self._current_evaluation_step = total_steps
+                    evaluation = self._evaluate_policy()
+                    if (
+                        evaluation is not None
+                        and evaluation["mean_reward"] > best_mean_reward
+                    ):
+                        best_mean_reward = evaluation["mean_reward"]
+                        self._save_model(
+                            step=total_steps,
+                            reason="best evaluation",
+                            save_path=self._best_save_path(),
+                        )
+                    while next_eval_step <= total_steps:
+                        next_eval_step += self.config.eval_interval_steps
+                    observation, info = self._reset_episode()
+                    self._log_episode_start(info)
+                    episode_reward = 0.0
+                    episode_length = 0
 
                 if len(episode_rewards) >= report_every:
                     avg_reward = float(np.mean(episode_rewards[-report_every:]))
@@ -1847,7 +1895,14 @@ class PPOTrainer:
 
             self._save_model(step=total_steps, reason="final")
             last_saved_steps = total_steps
-            self._evaluate_policy()
+            self._current_evaluation_step = total_steps
+            evaluation = self._evaluate_policy()
+            if evaluation is not None and evaluation["mean_reward"] > best_mean_reward:
+                self._save_model(
+                    step=total_steps,
+                    reason="best evaluation",
+                    save_path=self._best_save_path(),
+                )
         except (Exception, KeyboardInterrupt):
             if last_completed_update_steps > last_saved_steps:
                 try:
@@ -1866,7 +1921,13 @@ class PPOTrainer:
             if self.writer is not None:
                 self.writer.close()
 
-    def _evaluate_policy(self):
+    def _best_save_path(self) -> str:
+        if self.config.best_save_path:
+            return self.config.best_save_path
+        stem, extension = os.path.splitext(self.config.save_path)
+        return f"{stem}.best{extension or '.pt'}"
+
+    def _evaluate_policy(self, step: Optional[int] = None):
         self._evaluating = True
         rewards = []
         lengths = []
@@ -1875,170 +1936,194 @@ class PPOTrainer:
         altitude_errors = []
         attitude_errors = []
         idle_end_tilts = []
+        survival_times_s = []
         observation = None
-        for evaluation_index in range(self.config.eval_episodes):
-            if observation is None:
-                observation, start_info = self._reset_episode()
-                self._log_episode_start(start_info)
-                episode_start_idle = start_info.get("episode_start_idle", {})
-                if isinstance(episode_start_idle, dict):
-                    idle_end_tilts.append(
-                        float(
-                            episode_start_idle.get(
-                                "control_start_tilt_deg",
-                                0.0,
+        try:
+            for evaluation_index in range(self.config.eval_episodes):
+                if observation is None:
+                    observation, start_info = self._reset_episode()
+                    self._log_episode_start(start_info)
+                    episode_start_idle = start_info.get("episode_start_idle", {})
+                    if isinstance(episode_start_idle, dict):
+                        idle_end_tilts.append(
+                            float(
+                                episode_start_idle.get(
+                                    "control_start_tilt_deg",
+                                    0.0,
+                                )
                             )
                         )
+                episode_reward = 0.0
+                episode_length = 0
+                episode_start_physics_time_s = None
+                episode_last_physics_time_s = None
+                while True:
+                    obs_tensor = torch.as_tensor(
+                        observation, dtype=torch.float32, device=self.device
+                    ).unsqueeze(0)
+                    with torch.no_grad():
+                        action_tensor = self.model.deterministic_action(obs_tensor)
+                    action = action_tensor.squeeze(0).cpu().numpy()
+                    action = self._normalize_action(action)
+                    observation, reward, terminated, truncated, info = self.env.step(
+                        self._to_env_action(action)
                     )
-            episode_reward = 0.0
-            episode_length = 0
-            while True:
-                obs_tensor = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
-                with torch.no_grad():
-                    action_tensor = self.model.deterministic_action(obs_tensor)
-                action = action_tensor.squeeze(0).cpu().numpy()
-                action = self._normalize_action(action)
-                observation, reward, terminated, truncated, info = self.env.step(
-                    self._to_env_action(action)
+                    episode_reward += reward
+                    episode_length += 1
+                    debug_state = info.get("debug_state", {})
+                    if debug_state:
+                        physics_time_s = debug_state.get("physics_time_s")
+                        if isinstance(physics_time_s, (int, float)):
+                            if episode_start_physics_time_s is None:
+                                episode_start_physics_time_s = float(physics_time_s)
+                            episode_last_physics_time_s = float(physics_time_s)
+                    target_hover = info.get("target_hover", {})
+                    if debug_state and target_hover:
+                        dx = float(debug_state.get("x_m", 0.0)) - float(
+                            target_hover.get("x_m", 0.0)
+                        )
+                        dy = float(debug_state.get("y_m", 0.0)) - float(
+                            target_hover.get("y_m", 0.0)
+                        )
+                        position_errors.append(math.hypot(dx, dy))
+                        altitude_errors.append(
+                            abs(
+                                float(debug_state.get("altitude_agl_m", 0.0))
+                                - float(target_hover.get("altitude_agl_m", 0.0))
+                            )
+                        )
+                        if self.config.control_mode in {
+                            CONTROL_MODE_AILERON,
+                            CONTROL_MODE_AILERON_THROTTLE,
+                        }:
+                            aileron_features = info.get(
+                                "aileron_hover_features",
+                                {},
+                            )
+                            attitude_errors.append(
+                                abs(
+                                    float(
+                                        aileron_features.get(
+                                            "roll_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                            )
+                        elif self.config.control_mode in {
+                            CONTROL_MODE_RUDDER,
+                            CONTROL_MODE_RUDDER_THROTTLE,
+                        }:
+                            rudder_features = info.get(
+                                "rudder_hover_features",
+                                {},
+                            )
+                            attitude_errors.append(
+                                abs(
+                                    float(
+                                        rudder_features.get(
+                                            "rudder_angle_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                            )
+                        elif self.config.control_mode == CONTROL_MODE_THROTTLE:
+                            pass
+                        elif self.config.control_mode in {
+                            CONTROL_MODE_ELEVATOR,
+                            CONTROL_MODE_ELEVATOR_THROTTLE,
+                        }:
+                            elevator_features = info.get(
+                                "elevator_hover_features",
+                                {},
+                            )
+                            attitude_errors.append(
+                                abs(
+                                    float(
+                                        elevator_features.get(
+                                            "inclination_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                            )
+                        else:
+                            elevator_features = info.get(
+                                "elevator_hover_features",
+                                {},
+                            )
+                            aileron_features = info.get(
+                                "aileron_hover_features",
+                                {},
+                            )
+                            rudder_features = info.get(
+                                "rudder_hover_features",
+                                {},
+                            )
+                            attitude_errors.append(
+                                abs(
+                                    float(
+                                        elevator_features.get(
+                                            "inclination_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                                + abs(
+                                    float(
+                                        aileron_features.get(
+                                            "roll_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                                + abs(
+                                    float(
+                                        rudder_features.get(
+                                            "rudder_angle_error_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                            )
+                    if terminated or truncated:
+                        reason = info.get("termination_reason") or (
+                            "truncated" if truncated else "unknown"
+                        )
+                        termination_counts[reason] += 1
+                        if (
+                            truncated
+                            and evaluation_index + 1 < self.config.eval_episodes
+                        ):
+                            observation, start_info = self._start_after_truncation()
+                            self._log_episode_start(start_info)
+                            episode_start_idle = start_info.get(
+                                "episode_start_idle",
+                                {},
+                            )
+                            if isinstance(episode_start_idle, dict):
+                                idle_end_tilts.append(
+                                    float(
+                                        episode_start_idle.get(
+                                            "control_start_tilt_deg",
+                                            0.0,
+                                        )
+                                    )
+                                )
+                        else:
+                            observation = None
+                        break
+                rewards.append(episode_reward)
+                lengths.append(episode_length)
+                survival_times_s.append(
+                    max(0.0, episode_last_physics_time_s - episode_start_physics_time_s)
+                    if episode_start_physics_time_s is not None
+                    and episode_last_physics_time_s is not None
+                    else 0.0
                 )
-                episode_reward += reward
-                episode_length += 1
-                debug_state = info.get("debug_state", {})
-                target_hover = info.get("target_hover", {})
-                if debug_state and target_hover:
-                    dx = float(debug_state.get("x_m", 0.0)) - float(target_hover.get("x_m", 0.0))
-                    dy = float(debug_state.get("y_m", 0.0)) - float(target_hover.get("y_m", 0.0))
-                    position_errors.append(math.hypot(dx, dy))
-                    altitude_errors.append(
-                        abs(
-                            float(debug_state.get("altitude_agl_m", 0.0))
-                            - float(target_hover.get("altitude_agl_m", 0.0))
-                        )
-                    )
-                    if self.config.control_mode in {
-                        CONTROL_MODE_AILERON,
-                        CONTROL_MODE_AILERON_THROTTLE,
-                    }:
-                        aileron_features = info.get(
-                            "aileron_hover_features",
-                            {},
-                        )
-                        attitude_errors.append(
-                            abs(
-                                float(
-                                    aileron_features.get(
-                                        "roll_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                        )
-                    elif self.config.control_mode in {
-                        CONTROL_MODE_RUDDER,
-                        CONTROL_MODE_RUDDER_THROTTLE,
-                    }:
-                        rudder_features = info.get(
-                            "rudder_hover_features",
-                            {},
-                        )
-                        attitude_errors.append(
-                            abs(
-                                float(
-                                    rudder_features.get(
-                                        "rudder_angle_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                        )
-                    elif self.config.control_mode == CONTROL_MODE_THROTTLE:
-                        pass
-                    elif self.config.control_mode in {
-                        CONTROL_MODE_ELEVATOR,
-                        CONTROL_MODE_ELEVATOR_THROTTLE,
-                    }:
-                        elevator_features = info.get(
-                            "elevator_hover_features",
-                            {},
-                        )
-                        attitude_errors.append(
-                            abs(
-                                float(
-                                    elevator_features.get(
-                                        "inclination_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                        )
-                    else:
-                        elevator_features = info.get(
-                            "elevator_hover_features",
-                            {},
-                        )
-                        aileron_features = info.get(
-                            "aileron_hover_features",
-                            {},
-                        )
-                        rudder_features = info.get(
-                            "rudder_hover_features",
-                            {},
-                        )
-                        attitude_errors.append(
-                            abs(
-                                float(
-                                    elevator_features.get(
-                                        "inclination_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                            + abs(
-                                float(
-                                    aileron_features.get(
-                                        "roll_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                            + abs(
-                                float(
-                                    rudder_features.get(
-                                        "rudder_angle_error_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                        )
-                if terminated or truncated:
-                    reason = info.get("termination_reason") or ("truncated" if truncated else "unknown")
-                    termination_counts[reason] += 1
-                    if (
-                        truncated
-                        and evaluation_index + 1 < self.config.eval_episodes
-                    ):
-                        observation, start_info = (
-                            self._start_after_truncation()
-                        )
-                        self._log_episode_start(start_info)
-                        episode_start_idle = start_info.get(
-                            "episode_start_idle",
-                            {},
-                        )
-                        if isinstance(episode_start_idle, dict):
-                            idle_end_tilts.append(
-                                float(
-                                    episode_start_idle.get(
-                                        "control_start_tilt_deg",
-                                        0.0,
-                                    )
-                                )
-                            )
-                    else:
-                        observation = None
-                    break
-            rewards.append(episode_reward)
-            lengths.append(episode_length)
+        finally:
+            self._evaluating = False
         avg_reward = float(np.mean(rewards))
         avg_length = float(np.mean(lengths))
         reward_per_step = float(np.sum(rewards) / max(1, np.sum(lengths)))
@@ -2048,32 +2133,56 @@ class PPOTrainer:
             f"position_error={float(np.mean(position_errors)) if position_errors else 0.0:.3f}m, "
             f"altitude_error={float(np.mean(altitude_errors)) if altitude_errors else 0.0:.3f}m, "
             f"attitude_error={float(np.mean(attitude_errors)) if attitude_errors else 0.0:.3f}deg, "
+            f"survival_time={float(np.mean(survival_times_s)):.3f}s, "
             f"idle_end_tilt={float(np.mean(idle_end_tilts)) if idle_end_tilts else 0.0:.3f}deg, "
             f"terminations={dict(termination_counts)}"
         )
-        self._write_scalar("eval/avg_reward", avg_reward, self.config.timesteps)
-        self._write_scalar("eval/avg_length", avg_length, self.config.timesteps)
-        self._write_scalar("eval/reward_per_step", reward_per_step, self.config.timesteps)
+        metric_step = (
+            getattr(self, "_current_evaluation_step", self.config.timesteps)
+            if step is None
+            else step
+        )
+        self._write_scalar("eval/avg_reward", avg_reward, metric_step)
+        self._write_scalar("eval/avg_length", avg_length, metric_step)
+        self._write_scalar("eval/reward_per_step", reward_per_step, metric_step)
+        self._write_scalar(
+            "eval/survival_time_s", float(np.mean(survival_times_s)), metric_step
+        )
         self._write_scalar(
             "eval/position_error_m",
             float(np.mean(position_errors)) if position_errors else 0.0,
-            self.config.timesteps,
+            metric_step,
         )
         self._write_scalar(
             "eval/altitude_error_m",
             float(np.mean(altitude_errors)) if altitude_errors else 0.0,
-            self.config.timesteps,
+            metric_step,
         )
         self._write_scalar(
             "eval/attitude_error_deg",
             float(np.mean(attitude_errors)) if attitude_errors else 0.0,
-            self.config.timesteps,
+            metric_step,
         )
         for reason, count in termination_counts.items():
-            self._write_scalar(f"eval/termination/{reason}", float(count), self.config.timesteps)
+            self._write_scalar(f"eval/termination/{reason}", float(count), metric_step)
             self._write_scalar(
                 f"eval/termination_rate/{reason}",
                 float(count) / max(1, self.config.eval_episodes),
-                self.config.timesteps,
+                metric_step,
             )
-        self._evaluating = False
+        return {
+            "mean_reward": avg_reward,
+            "mean_episode_steps": avg_length,
+            "mean_survival_time_s": float(np.mean(survival_times_s)),
+            "reward_per_step": reward_per_step,
+            "mean_position_error_m": float(np.mean(position_errors))
+            if position_errors
+            else 0.0,
+            "mean_altitude_error_m": float(np.mean(altitude_errors))
+            if altitude_errors
+            else 0.0,
+            "mean_attitude_error_deg": float(np.mean(attitude_errors))
+            if attitude_errors
+            else 0.0,
+            "termination_counts": dict(termination_counts),
+        }
