@@ -1035,6 +1035,19 @@ class PPOTrainer:
         reward: float,
         info: Dict,
     ):
+        debug_state = info.get("debug_state", {})
+        if debug_state:
+            self._write_scalar(
+                "train/state/x_m", float(debug_state.get("x_m", 0.0)), total_steps
+            )
+            self._write_scalar(
+                "train/state/y_m", float(debug_state.get("y_m", 0.0)), total_steps
+            )
+            self._write_scalar(
+                "train/state/altitude_agl_m",
+                float(debug_state.get("altitude_agl_m", 0.0)),
+                total_steps,
+            )
         if self.config.control_mode == CONTROL_MODE_THROTTLE:
             features = info.get("throttle_hover_features", {})
             if not features:

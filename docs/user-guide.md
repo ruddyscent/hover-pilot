@@ -722,6 +722,34 @@ uv run tensorboard --logdir runs
 
 Then open `http://localhost:6006`.
 
+Generate a self-contained HTML summary from a TensorBoard run directory:
+
+```bash
+uv run hoverpilot-ppo report runs/experiment-001
+```
+
+The default output is `runs/experiment-001/report.html`. The report contains
+reward and control-error curves, termination-reason counts, checkpoint evaluation
+history and reproducibility metadata. Training now records sampled X/Y telemetry,
+so new runs also include a top-down flight trajectory. Older runs without those
+scalars simply omit the trajectory section.
+
+If the checkpoint is not stored below the run directory, provide it explicitly.
+You can also compare its latest deterministic evaluation with an earlier
+checkpoint and link an existing evaluation video:
+
+```bash
+uv run hoverpilot-ppo report runs/experiment-001 \
+  --checkpoint checkpoints/elevator.best.pt \
+  --compare-to checkpoints/elevator-previous.pt \
+  --video recordings/elevator-eval.mp4 \
+  --output reports/elevator.html
+```
+
+Report generation does not connect to RealFlight or record video. `--video`
+embeds a player linked to an existing recording. Automated simulator capture
+requires a separate recording integration.
+
 Useful TensorBoard scalars include:
 
 - `train/episode_reward`

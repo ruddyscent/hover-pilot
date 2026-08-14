@@ -17,6 +17,7 @@ from .constants import (
 )
 from .experiment_config import load_experiment_config
 from .player import PPOPlayer
+from .report import generate_training_report
 from .trainer import PPOTrainer
 
 
@@ -290,6 +291,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     _add_rflink_args(evaluate_parser)
 
+    report_parser = subparsers.add_parser(
+        "report", help="Generate an HTML report from a training run"
+    )
+    report_parser.add_argument("run_dir", help="TensorBoard run directory")
+    report_parser.add_argument("--checkpoint", default=None)
+    report_parser.add_argument("--compare-to", default=None)
+    report_parser.add_argument("--output", default=None)
+    report_parser.add_argument(
+        "--video", default=None, help="Optional evaluation video to link in the report"
+    )
+
     diagnose_parser = subparsers.add_parser(
         "diagnose-elevator",
         help="Measure RealFlight pitch response to conservative elevator pulses",
@@ -414,6 +426,15 @@ def main(argv: Optional[List[str]] = None):
                 f"position_error={current.mean_position_error_m - baseline.mean_position_error_m:+.3f}m "
                 f"attitude_error={current.mean_attitude_error_deg - baseline.mean_attitude_error_deg:+.3f}deg"
             )
+    elif args.command == "report":
+        output = generate_training_report(
+            args.run_dir,
+            checkpoint_path=args.checkpoint,
+            compare_to=args.compare_to,
+            output_path=args.output,
+            video_path=args.video,
+        )
+        print(f"[REPORT] Wrote {output}")
     elif args.command == "diagnose-elevator":
         diagnose_elevator_response(
             args.host,
