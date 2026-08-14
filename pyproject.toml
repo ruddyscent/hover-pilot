@@ -3,11 +3,25 @@ requires = ["setuptools>=83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hoverpilot-rflink"
+name = "hover-pilot"
 version = "0.1.0"
-description = "RealFlight Link client for HoverPilot"
+description = "RealFlight Link client and Gymnasium hover environment"
 readme = "README.md"
 requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Kyungwon Chun" },
+]
+keywords = ["realflight", "gymnasium", "reinforcement-learning", "ppo"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
 dependencies = [
     "gymnasium",
@@ -15,6 +29,12 @@ dependencies = [
     "pydantic",
     "python-dotenv"
 ]
+
+[project.urls]
+Homepage = "https://github.com/ruddyscent/hover-pilot"
+Repository = "https://github.com/ruddyscent/hover-pilot"
+Issues = "https://github.com/ruddyscent/hover-pilot/issues"
+Documentation = "https://github.com/ruddyscent/hover-pilot/blob/main/docs/user-guide.md"
 
 [project.optional-dependencies]
 rl = [

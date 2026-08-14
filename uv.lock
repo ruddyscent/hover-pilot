@@ -533,7 +533,7 @@ wheels = [
 ]
 
 [[package]]
-name = "hoverpilot-rflink"
+name = "hover-pilot"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
