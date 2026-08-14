@@ -24,6 +24,7 @@ from .constants import (
     POLICY_PRESET_ELEVATOR_PD,
     POLICY_PRESETS,
     PPO_CHECKPOINT_FORMAT,
+    PPO_CHECKPOINT_SUPPORTED_VERSIONS,
     PPO_CHECKPOINT_VERSION,
     _AILERON_OBSERVATION_CONFIG_FIELDS,
     _AILERON_THROTTLE_OBSERVATION_CONFIG_FIELDS,
@@ -176,7 +177,7 @@ def load_policy_checkpoint(checkpoint_path: str) -> PPOCheckpoint:
     format_version = checkpoint.get("format_version")
     if (
         checkpoint_format != PPO_CHECKPOINT_FORMAT
-        or format_version != PPO_CHECKPOINT_VERSION
+        or format_version not in PPO_CHECKPOINT_SUPPORTED_VERSIONS
     ):
         raise ValueError(
             "Unsupported PPO checkpoint "
@@ -188,6 +189,16 @@ def load_policy_checkpoint(checkpoint_path: str) -> PPOCheckpoint:
         raise ValueError(
             f"PPO checkpoint has unsupported control_mode={control_mode!r}"
         )
+    training_step = checkpoint.get("training_step", 0)
+    if isinstance(training_step, bool) or not isinstance(training_step, int) or training_step < 0:
+        raise ValueError("PPO checkpoint training_step must be a non-negative integer")
+    best_mean_reward = checkpoint.get("best_mean_reward")
+    if best_mean_reward is not None and (
+        isinstance(best_mean_reward, bool)
+        or not isinstance(best_mean_reward, (int, float))
+        or not math.isfinite(best_mean_reward)
+    ):
+        raise ValueError("PPO checkpoint best_mean_reward must be finite or null")
 
     return PPOCheckpoint(
         model_state_dict=_validate_policy_state_dict(
@@ -211,6 +222,43 @@ def load_policy_checkpoint(checkpoint_path: str) -> PPOCheckpoint:
             if isinstance(checkpoint.get("experiment_metadata", {}), Mapping)
             else {}
         ),
+        format_version=int(format_version),
+        optimizer_state_dict=(
+            checkpoint.get("optimizer_state_dict")
+            if isinstance(checkpoint.get("optimizer_state_dict"), Mapping)
+            else None
+        ),
+        scheduler_state_dict=(
+            checkpoint.get("scheduler_state_dict")
+            if isinstance(checkpoint.get("scheduler_state_dict"), Mapping)
+            else None
+        ),
+        training_step=training_step,
+        rng_state=(
+            dict(checkpoint.get("rng_state", {}))
+            if isinstance(checkpoint.get("rng_state", {}), Mapping)
+            else {}
+        ),
+        evaluation_history=tuple(
+            item
+            for item in checkpoint.get("evaluation_history", ())
+            if isinstance(item, Mapping)
+        ),
+        best_mean_reward=(
+            float(best_mean_reward)
+            if isinstance(best_mean_reward, (int, float))
+            else None
+        ),
+        environment_config=(
+            dict(checkpoint.get("environment_config", {}))
+            if isinstance(checkpoint.get("environment_config", {}), Mapping)
+            else {}
+        ),
+        reward_config=(
+            dict(checkpoint.get("reward_config", {}))
+            if isinstance(checkpoint.get("reward_config", {}), Mapping)
+            else {}
+        ),
     )
 
 
@@ -221,6 +269,14 @@ def build_policy_checkpoint(
     elevator_fixed_throttle: float,
     reward_config: RewardConfig,
     experiment_metadata: Mapping[str, object] | None = None,
+    optimizer_state_dict: Mapping[str, object] | None = None,
+    scheduler_state_dict: Mapping[str, object] | None = None,
+    training_step: int = 0,
+    rng_state: Mapping[str, object] | None = None,
+    evaluation_history: tuple[Mapping[str, object], ...] = (),
+    best_mean_reward: float | None = None,
+    environment_config: Mapping[str, object] | None = None,
+    full_reward_config: Mapping[str, object] | None = None,
 ) -> Dict[str, object]:
     """Build the portable, versioned representation of a PPO policy."""
 
@@ -248,5 +304,13 @@ def build_policy_checkpoint(
             control_mode,
         ),
         "experiment_metadata": dict(experiment_metadata or {}),
+        "optimizer_state_dict": optimizer_state_dict,
+        "scheduler_state_dict": scheduler_state_dict,
+        "training_step": int(training_step),
+        "rng_state": dict(rng_state or {}),
+        "evaluation_history": list(evaluation_history),
+        "best_mean_reward": best_mean_reward,
+        "environment_config": dict(environment_config or {}),
+        "reward_config": dict(full_reward_config or {}),
     }
     return checkpoint

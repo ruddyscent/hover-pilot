@@ -7,7 +7,7 @@ import os
 import random
 import time
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Dict, Mapping, Optional, Tuple
 
 import gymnasium as gym
@@ -27,6 +27,7 @@ from hoverpilot.envs import (
 from hoverpilot.training.hover import (
     HOVER_TARGET_INCLINATION_DEG,
     ElevatorHoverFeatures,
+    RewardConfig,
 )
 from hoverpilot.utils.logger import format_debug_state
 
@@ -132,13 +133,34 @@ class PPOTrainer:
             else None
         )
         if resume_checkpoint is not None:
-            config = replace(
-                config,
-                reward_config=_apply_observation_config(
-                    config.reward_config,
-                    resume_checkpoint.observation_config,
-                ),
-            )
+            if resume_checkpoint.reward_config:
+                config = replace(
+                    config,
+                    reward_config=RewardConfig(**resume_checkpoint.reward_config),
+                )
+            else:
+                config = replace(
+                    config,
+                    reward_config=_apply_observation_config(
+                        config.reward_config,
+                        resume_checkpoint.observation_config,
+                    ),
+                )
+            if resume_checkpoint.environment_config:
+                restorable = {
+                    name: value
+                    for name, value in resume_checkpoint.environment_config.items()
+                    if name in {
+                        "max_episode_steps",
+                        "sleep_interval_s",
+                        "episode_start_idle_seconds",
+                        "episode_start_idle_throttle",
+                        "episode_start_idle_curriculum_steps",
+                        "episode_start_idle_curriculum_start_seconds",
+                        "episode_start_handoff_seconds",
+                    }
+                }
+                config = replace(config, **restorable)
         if resume_checkpoint is not None:
             if resume_checkpoint.control_mode != config.control_mode:
                 raise ValueError(
@@ -200,9 +222,98 @@ class PPOTrainer:
         self.optimizer = torch.optim.Adam(
             self.model.parameters(), lr=config.learning_rate
         )
+        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=lambda _: 1.0
+        )
+        self.training_step = 0
+        self.evaluation_history: list[dict[str, object]] = []
+        self.best_mean_reward = -math.inf
+        if resume_checkpoint is not None:
+            self._restore_training_state(resume_checkpoint, config.resume_from)
         self.writer = self._build_writer()
         self._curriculum_exposure_steps = 0
         self._evaluating = False
+
+    def _restore_training_state(
+        self, checkpoint: PPOCheckpoint, checkpoint_path: str
+    ) -> None:
+        if checkpoint.optimizer_state_dict is None:
+            print(
+                f"[PPO] Checkpoint {checkpoint_path} has policy weights only; "
+                "optimizer, scheduler, step, and RNG start fresh"
+            )
+            return
+        self.optimizer.load_state_dict(checkpoint.optimizer_state_dict)
+        for state in self.optimizer.state.values():
+            for key, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(self.device)
+        if checkpoint.scheduler_state_dict is not None:
+            self.scheduler.load_state_dict(checkpoint.scheduler_state_dict)
+        self.training_step = checkpoint.training_step
+        self.evaluation_history = [dict(item) for item in checkpoint.evaluation_history]
+        self.best_mean_reward = (
+            checkpoint.best_mean_reward
+            if checkpoint.best_mean_reward is not None
+            else -math.inf
+        )
+        self._restore_rng_state(checkpoint.rng_state)
+        print(
+            f"[PPO] Restored full training state from {checkpoint_path} "
+            f"at step={self.training_step} evaluations={len(self.evaluation_history)}"
+        )
+
+    def _capture_rng_state(self) -> dict[str, object]:
+        numpy_state = np.random.get_state()
+        state: dict[str, object] = {
+            "python": random.getstate(),
+            "numpy": {
+                "bit_generator": numpy_state[0],
+                "state": torch.as_tensor(numpy_state[1].copy()),
+                "position": numpy_state[2],
+                "has_gauss": numpy_state[3],
+                "cached_gaussian": numpy_state[4],
+            },
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: Mapping[str, object]) -> None:
+        python_state = state.get("python")
+        if isinstance(python_state, tuple):
+            random.setstate(python_state)
+        numpy_state = state.get("numpy")
+        if isinstance(numpy_state, Mapping) and isinstance(
+            numpy_state.get("state"), torch.Tensor
+        ):
+            np.random.set_state(
+                (
+                    str(numpy_state["bit_generator"]),
+                    numpy_state["state"].cpu().numpy().astype(np.uint32),
+                    int(numpy_state["position"]),
+                    int(numpy_state["has_gauss"]),
+                    float(numpy_state["cached_gaussian"]),
+                )
+            )
+        torch_state = state.get("torch")
+        if isinstance(torch_state, torch.Tensor):
+            torch.set_rng_state(torch_state.cpu())
+        cuda_state = state.get("torch_cuda")
+        if torch.cuda.is_available() and isinstance(cuda_state, list):
+            torch.cuda.set_rng_state_all(cuda_state)
+
+    def _environment_config(self) -> dict[str, object]:
+        return {
+            "max_episode_steps": self.config.max_episode_steps,
+            "sleep_interval_s": self.config.sleep_interval_s,
+            "episode_start_idle_seconds": self.config.episode_start_idle_seconds,
+            "episode_start_idle_throttle": self.config.episode_start_idle_throttle,
+            "episode_start_idle_curriculum_steps": self.config.episode_start_idle_curriculum_steps,
+            "episode_start_idle_curriculum_start_seconds": self.config.episode_start_idle_curriculum_start_seconds,
+            "episode_start_handoff_seconds": self.config.episode_start_handoff_seconds,
+        }
 
     def _load_resume_checkpoint(
         self,
@@ -1378,7 +1489,7 @@ class PPOTrainer:
             or "none"
         )
         print(
-            f"[PPO] rollout steps={total_steps}/{self.config.timesteps} "
+            f"[PPO] rollout steps={total_steps}/{getattr(self, '_target_steps', self.config.timesteps)} "
             f"samples={rollout.index} reward_mean={np.mean(rewards):+.3f} "
             f"reward_min={np.min(rewards):+.3f} reward_max={np.max(rewards):+.3f} "
             f"done_rate={sum(1 for reason in termination_reasons if reason != 'incomplete') / max(1, rollout.index):.3f} "
@@ -1403,7 +1514,7 @@ class PPOTrainer:
         advantages: torch.Tensor,
     ):
         print(
-            f"[PPO] update steps={total_steps}/{self.config.timesteps} "
+            f"[PPO] update steps={total_steps}/{getattr(self, '_target_steps', self.config.timesteps)} "
             f"policy_loss={np.mean(policy_losses):+.4f} "
             f"value_loss={np.mean(value_losses):+.4f} "
             f"entropy={np.mean(entropy_values):.4f} "
@@ -1449,6 +1560,18 @@ class PPOTrainer:
                     elevator_fixed_throttle=self.elevator_fixed_throttle,
                     reward_config=self.config.reward_config,
                     experiment_metadata=self.experiment_metadata,
+                    optimizer_state_dict=self.optimizer.state_dict(),
+                    scheduler_state_dict=self.scheduler.state_dict(),
+                    training_step=step,
+                    rng_state=self._capture_rng_state(),
+                    evaluation_history=tuple(self.evaluation_history),
+                    best_mean_reward=(
+                        self.best_mean_reward
+                        if math.isfinite(self.best_mean_reward)
+                        else None
+                    ),
+                    environment_config=self._environment_config(),
+                    full_reward_config=asdict(self.config.reward_config),
                 ),
                 temporary_path,
             )
@@ -1460,12 +1583,23 @@ class PPOTrainer:
         self._write_scalar("train/checkpoint_step", float(step), step)
 
     def train(self):
-        total_steps = 0
-        last_completed_update_steps = 0
-        last_saved_steps = 0
-        next_checkpoint_step = self.config.checkpoint_interval_steps
-        next_eval_step = self.config.eval_interval_steps
-        best_mean_reward = -math.inf
+        total_steps = self.training_step
+        target_steps = total_steps + self.config.timesteps
+        self._target_steps = target_steps
+        last_completed_update_steps = total_steps
+        last_saved_steps = total_steps
+        next_checkpoint_step = (
+            (total_steps // self.config.checkpoint_interval_steps + 1)
+            * self.config.checkpoint_interval_steps
+            if self.config.checkpoint_interval_steps > 0
+            else 0
+        )
+        next_eval_step = (
+            (total_steps // self.config.eval_interval_steps + 1)
+            * self.config.eval_interval_steps
+            if self.config.eval_interval_steps > 0
+            else 0
+        )
         report_every = max(1, self.config.log_interval)
         training_start = time.time()
         episode_rewards = []
@@ -1525,7 +1659,7 @@ class PPOTrainer:
             episode_reward = 0.0
             episode_length = 0
 
-            while total_steps < self.config.timesteps:
+            while total_steps < target_steps:
                 rollout = RolloutBuffer(
                     self.config.n_steps,
                     *self.env.observation_space.shape,
@@ -1617,7 +1751,7 @@ class PPOTrainer:
                         self._log_episode_start(info)
                         episode_reward = 0.0
                         episode_length = 0
-                    if total_steps >= self.config.timesteps:
+                    if total_steps >= target_steps:
                         break
 
                 last_value = self.model(
@@ -1818,6 +1952,7 @@ class PPOTrainer:
                 self._write_scalar(
                     "train/kl_early_stop", float(stopped_for_kl), total_steps
                 )
+                self.scheduler.step()
                 self._write_aileron_recovery_probe(total_steps)
                 self._write_elevator_recovery_probe(total_steps)
                 self._write_rudder_recovery_probe(total_steps)
@@ -1853,7 +1988,7 @@ class PPOTrainer:
                 if (
                     self.config.checkpoint_interval_steps > 0
                     and total_steps >= next_checkpoint_step
-                    and total_steps < self.config.timesteps
+                    and total_steps < target_steps
                 ):
                     self._save_model(step=total_steps, reason="periodic checkpoint")
                     last_saved_steps = total_steps
@@ -1863,15 +1998,19 @@ class PPOTrainer:
                 if (
                     self.config.eval_interval_steps > 0
                     and total_steps >= next_eval_step
-                    and total_steps < self.config.timesteps
+                    and total_steps < target_steps
                 ):
                     self._current_evaluation_step = total_steps
                     evaluation = self._evaluate_policy()
+                    if evaluation is not None:
+                        self.evaluation_history.append(
+                            {"step": total_steps, **evaluation}
+                        )
                     if (
                         evaluation is not None
-                        and evaluation["mean_reward"] > best_mean_reward
+                        and evaluation["mean_reward"] > self.best_mean_reward
                     ):
-                        best_mean_reward = evaluation["mean_reward"]
+                        self.best_mean_reward = evaluation["mean_reward"]
                         self._save_model(
                             step=total_steps,
                             reason="best evaluation",
@@ -1889,7 +2028,7 @@ class PPOTrainer:
                     avg_length = float(np.mean(episode_lengths[-report_every:]))
                     elapsed = time.time() - training_start
                     print(
-                        f"[PPO] steps={total_steps}/{self.config.timesteps} "
+                        f"[PPO] steps={total_steps}/{target_steps} "
                         f"avg_reward={avg_reward:.3f} avg_length={avg_length:.1f} elapsed={elapsed:.1f}s"
                     )
                     self._write_scalar("train/avg_reward", avg_reward, total_steps)
@@ -1898,16 +2037,22 @@ class PPOTrainer:
                 if self.writer is not None:
                     self.writer.flush()
 
-            self._save_model(step=total_steps, reason="final")
-            last_saved_steps = total_steps
             self._current_evaluation_step = total_steps
             evaluation = self._evaluate_policy()
-            if evaluation is not None and evaluation["mean_reward"] > best_mean_reward:
+            if evaluation is not None:
+                self.evaluation_history.append({"step": total_steps, **evaluation})
+            if (
+                evaluation is not None
+                and evaluation["mean_reward"] > self.best_mean_reward
+            ):
+                self.best_mean_reward = evaluation["mean_reward"]
                 self._save_model(
                     step=total_steps,
                     reason="best evaluation",
                     save_path=self._best_save_path(),
                 )
+            self._save_model(step=total_steps, reason="final")
+            last_saved_steps = total_steps
         except (Exception, KeyboardInterrupt):
             if last_completed_update_steps > last_saved_steps:
                 try:

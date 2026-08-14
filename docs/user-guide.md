@@ -621,14 +621,21 @@ uv run hoverpilot-ppo train --control-mode elevator \
   --timesteps 10000
 ```
 
-HoverPilot PPO checkpoints use structured format v2. They record policy/value
-weights, control mode, policy preset, fixed elevator throttle, and the
-observation/recovery scaling configuration. Version 1 checkpoints are rejected
-because their observation and actor definitions are incompatible.
+HoverPilot PPO checkpoints use structured format v3. They record policy/value
+weights, optimizer and learning-rate scheduler state, cumulative training step,
+Python/NumPy/PyTorch random-generator states, evaluation history and best score,
+environment settings, the complete reward configuration, control mode, policy
+preset, and fixed elevator throttle. Version 1 checkpoints are rejected because
+their observation and actor definitions are incompatible. Version 2 checkpoints
+remain usable for playback and evaluation; resuming one restores its policy
+weights and starts the missing optimizer, scheduler, step, and RNG state fresh.
 When resuming, `--control-mode` must match the checkpoint; the saved policy
 preset and fixed throttle take precedence over their command-line defaults.
-The optimizer is recreated with the command's current learning rate and tuning
-options.
+For a v3 checkpoint, environment and reward settings are restored from the
+checkpoint, while connection, device, output path, and run-length options remain
+controlled by the new command. `--timesteps` is the number of additional steps
+to train; log and evaluation step numbers continue from the saved cumulative
+step.
 
 Training saves the latest policy to `--save-path` and evaluates the deterministic
 policy every `--eval-interval-steps` (10,240 by default). When the mean evaluation

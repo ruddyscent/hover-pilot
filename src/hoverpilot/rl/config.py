@@ -92,3 +92,12 @@ class PPOCheckpoint:
     elevator_fixed_throttle: float
     observation_config: Mapping[str, float]
     experiment_metadata: Mapping[str, object] = field(default_factory=dict)
+    format_version: int = 2
+    optimizer_state_dict: Optional[Mapping[str, object]] = None
+    scheduler_state_dict: Optional[Mapping[str, object]] = None
+    training_step: int = 0
+    rng_state: Mapping[str, object] = field(default_factory=dict)
+    evaluation_history: Tuple[Mapping[str, object], ...] = ()
+    best_mean_reward: Optional[float] = None
+    environment_config: Mapping[str, object] = field(default_factory=dict)
+    reward_config: Mapping[str, object] = field(default_factory=dict)

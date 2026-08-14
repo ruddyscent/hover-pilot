@@ -1406,7 +1406,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
                         elevator_fixed_throttle=0.55,
                         reward_config=RewardConfig(),
                     ),
-                    "format_version": PPO_CHECKPOINT_VERSION - 1,
+                    "format_version": 1,
                 },
                 {
                     **build_policy_checkpoint(
@@ -1723,6 +1723,14 @@ class PPOTrainingModuleTests(unittest.TestCase):
                     "elevator_fixed_throttle",
                     "observation_config",
                     "experiment_metadata",
+                    "optimizer_state_dict",
+                    "scheduler_state_dict",
+                    "training_step",
+                    "rng_state",
+                    "evaluation_history",
+                    "best_mean_reward",
+                    "environment_config",
+                    "reward_config",
                 },
             )
             self.assertEqual(
@@ -1730,6 +1738,10 @@ class PPOTrainingModuleTests(unittest.TestCase):
                 "2.0.0",
             )
             self.assertIn("resolved_config", saved_checkpoint["experiment_metadata"])
+            self.assertEqual(saved_checkpoint["training_step"], 128)
+            self.assertIsNotNone(saved_checkpoint["optimizer_state_dict"])
+            self.assertIsNotNone(saved_checkpoint["scheduler_state_dict"])
+            self.assertIn("python", saved_checkpoint["rng_state"])
             self.assertEqual(saved_checkpoint["checkpoint_format"], PPO_CHECKPOINT_FORMAT)
             self.assertEqual(saved_checkpoint["format_version"], PPO_CHECKPOINT_VERSION)
             self.assertIn(
