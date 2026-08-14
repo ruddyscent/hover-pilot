@@ -38,6 +38,8 @@ Documentation = "https://github.com/ruddyscent/hover-pilot/blob/main/docs/user-g
 
 [project.optional-dependencies]
 rl = [
+    # requests 2.33+ requires Python 3.10, while the Jetson workflow supports 3.8.
+    "requests<2.33; python_version < '3.10'",
     "tensorboard>=2.10,<2.16; python_version < '3.9'",
     "tensorboard>=2.16.0; python_version >= '3.9'",
     "torch>=1.12; python_version < '3.10'",
