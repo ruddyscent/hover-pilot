@@ -321,12 +321,17 @@ uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
 
 ### TOML experiment configuration
 
-For repeatable experiments, start from the included
-[`configs/elevator.toml`](../configs/elevator.toml):
+For repeatable experiments, start from the
+[`configs/elevator.toml`](../configs/elevator.toml) included in a source
+checkout:
 
 ```bash
 uv run hoverpilot-ppo train --config configs/elevator.toml
 ```
+
+The example file is maintained as a repository asset and is not installed into
+the active directory by the PyPI wheel. When using a PyPI installation, download
+or copy the example first, or create an equivalent local TOML file.
 
 The file groups settings under `[environment]`, `[training]`, `[policy]`,
 `[episode_start]`, `[checkpoint]`, `[evaluation]`, `[logging]`, and `[rflink]`.
@@ -704,7 +709,7 @@ The task-specific switches include `--control-mode`, `--policy-preset`,
 `--elevator-fixed-throttle`, `--episode-start-idle-seconds`,
 `--episode-start-idle-throttle`, `--episode-start-idle-curriculum-steps`,
 `--episode-start-idle-curriculum-start-seconds`,
-`--episode-start-handoff-seconds`, `--resume-from`, and
+`--episode-start-handoff-seconds`, `--resume-from`,
 `--checkpoint-interval-steps`, `--eval-interval-steps`, and
 `--best-save-path`.
 
@@ -747,8 +752,12 @@ uv run hoverpilot-ppo report runs/experiment-001 \
 ```
 
 Report generation does not connect to RealFlight or record video. `--video`
-embeds a player linked to an existing recording. Automated simulator capture
-requires a separate recording integration.
+embeds a player linked to an existing recording. This external reference means
+the HTML is no longer fully portable unless the video is distributed with it.
+Automated simulator capture requires a separate recording integration. The X/Y
+trajectory is available only when the run contains `train/state/x_m` and
+`train/state/y_m`, and `--checkpoint` is required when the desired checkpoint is
+outside the run directory.
 
 Useful TensorBoard scalars include:
 

@@ -46,7 +46,10 @@ def _add_rflink_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train, play, or diagnose PPO policies on the HoverPilot Hover Env."
+        description=(
+            "Train, play, evaluate, report, or diagnose PPO policies on the "
+            "HoverPilot Hover Env."
+        )
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
@@ -127,7 +130,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--eval-episodes",
         type=int,
         default=None,
-        help=("Final evaluation episodes. Defaults to 10."),
+        help=(
+            "Episodes per periodic and final deterministic evaluation. "
+            "Defaults to 10."
+        ),
     )
     train_parser.add_argument(
         "--tensorboard-log-dir", type=str, default="runs/hoverpilot-ppo"
