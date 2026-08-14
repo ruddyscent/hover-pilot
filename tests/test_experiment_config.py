@@ -66,6 +66,32 @@ def test_unknown_toml_key_is_rejected(tmp_path: Path):
         load_experiment_config(str(config_path))
 
 
+def test_unknown_toml_section_is_rejected(tmp_path: Path):
+    config_path = tmp_path / "invalid-section.toml"
+    config_path.write_text("[curriculum]\nstages = 3\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown experiment config sections"):
+        load_experiment_config(str(config_path))
+
+
+def test_invalid_toml_and_missing_file_report_the_source(tmp_path: Path):
+    invalid_path = tmp_path / "broken.toml"
+    invalid_path.write_text("[training\nseed = 1", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Invalid experiment TOML.*broken.toml"):
+        load_experiment_config(str(invalid_path))
+    with pytest.raises(ValueError, match="Cannot read experiment config.*missing.toml"):
+        load_experiment_config(str(tmp_path / "missing.toml"))
+
+
+def test_logging_enabled_requires_boolean(tmp_path: Path):
+    config_path = tmp_path / "invalid-logging.toml"
+    config_path.write_text('[logging]\nenabled = "yes"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"\[logging\]\.enabled must be boolean"):
+        load_experiment_config(str(config_path))
+
+
 def test_experiment_metadata_contains_source_and_resolved_config(tmp_path: Path):
     config_path = tmp_path / "experiment.toml"
     config_path.write_text("[training]\nseed = 42\n", encoding="utf-8")

@@ -58,5 +58,19 @@ def test_full_training_checkpoint_restores_run_state(tmp_path: Path):
     )
     assert resumed.optimizer.state_dict()["state"]
 
+    for trainer in (original, resumed):
+        continuation_loss = sum(
+            parameter.square().sum() for parameter in trainer.model.parameters()
+        )
+        trainer.optimizer.zero_grad()
+        continuation_loss.backward()
+        trainer.optimizer.step()
+        trainer.scheduler.step()
+    for original_parameter, resumed_parameter in zip(
+        original.model.parameters(), resumed.model.parameters()
+    ):
+        torch.testing.assert_close(original_parameter, resumed_parameter)
+    assert original.scheduler.state_dict() == resumed.scheduler.state_dict()
+
     original.env.close()
     resumed.env.close()
