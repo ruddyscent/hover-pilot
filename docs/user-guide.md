@@ -225,15 +225,14 @@ the provided Compose file [compose.jetson.yml](../compose.jetson.yml).
 
 Prerequisites on the Jetson host:
 
-- JetPack 5.0.2 or newer installed on the device
+- A JetPack/L4T release with an NGC PyTorch image that provides Python 3.10 or newer
 - NVIDIA Container Toolkit configured for Docker
 - Docker access for your user
 - NGC login completed with `docker login nvcr.io`
 
-HoverPilot's Jetson container workflow assumes a JetPack 5.x class environment with
-Ubuntu 20.04 / Python 3.8. JetPack 5.0.2 is the minimum supported baseline in this
-guide because it is the first production-quality JetPack 5 release and supports
-NVIDIA Jetson Xavier NX modules.
+HoverPilot requires Python 3.10 or newer. Older JetPack 5 images based on Python
+3.8 are no longer supported because their PyTorch and packaging dependency lines
+contain known vulnerabilities that cannot all be patched on that Python version.
 
 The exact NGC image tag must match the JetPack / L4T release on the device.
 Use [.env.example](../.env.example) as a template:
