@@ -1735,7 +1735,7 @@ class PPOTrainingModuleTests(unittest.TestCase):
             )
             self.assertEqual(
                 saved_checkpoint["experiment_metadata"]["package_version"],
-                "2.0.0",
+                "2.1.0",
             )
             self.assertIn("resolved_config", saved_checkpoint["experiment_metadata"])
             self.assertEqual(saved_checkpoint["training_step"], 128)

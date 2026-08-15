@@ -100,7 +100,7 @@ def test_experiment_metadata_contains_source_and_resolved_config(tmp_path: Path)
     metadata = build_experiment_metadata(config, config_path=str(config_path))
 
     assert metadata["seed"] == 42
-    assert metadata["package_version"] == "2.0.0"
+    assert metadata["package_version"] == "2.1.0"
     assert metadata["config_path"] == str(config_path.resolve())
     assert metadata["config_file"] == {"training": {"seed": 42}}
     assert metadata["resolved_config"]["seed"] == 42
