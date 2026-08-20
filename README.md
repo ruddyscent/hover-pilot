@@ -7,7 +7,8 @@ RC commands, and expose a Gymnasium-compatible hover environment.
 
 ## Installation
 
-Install the base package from PyPI:
+HoverPilot requires Python 3.10 or newer and a running copy of RealFlight with
+RealFlight Link enabled. Install the base package from PyPI:
 
 ```bash
 pip install hover-pilot
@@ -19,25 +20,86 @@ Install the optional PPO training, evaluation, and reporting dependencies:
 pip install "hover-pilot[rl]"
 ```
 
-With uv, use `uv add hover-pilot` or `uv add "hover-pilot[rl]"`.
+With uv, use `uv tool install hover-pilot` for the command-line tools, or
+`uv add hover-pilot` when adding the library to another project.
 
 ## Quickstart
 
-From a source checkout, install dependencies and run the demo with `uv`:
+### 1. Prepare RealFlight
+
+Before running HoverPilot:
+
+1. Start RealFlight and load an Airplane Hover Trainer scenario.
+2. Enable RealFlight Link and confirm it listens on TCP port `18083`.
+3. If RealFlight is on another computer, set `RFLINK_HOST` to an address that is
+   reachable from the machine running HoverPilot.
+
+```bash
+export RFLINK_HOST=127.0.0.1  # replace when RealFlight runs elsewhere
+export RFLINK_PORT=18083
+```
+
+### 2. Check connectivity safely
+
+The doctor opens and closes a TCP connection only. It does not inject a
+controller or send flight controls.
+
+```bash
+hoverpilot-doctor
+```
+
+Do not continue until this reports `OK`.
+
+### 3. Validate the environment
+
+The default validation uses neutral controls with zero throttle:
+
+```bash
+hoverpilot-validate --episodes 1 --max-episode-steps 50
+```
+
+Add `--control-test` only when you intentionally want to send random controls
+to test action scaling.
+
+### 4. Run the bounded demo
+
+The demo sends neutral aileron, elevator, and rudder with throttle `0.55`. It
+stops after 100 control steps by default:
+
+```bash
+hoverpilot-demo
+```
+
+Inspect options before changing its duration or throttle:
+
+```bash
+hoverpilot-demo --help
+```
+
+### Source checkout
+
+Contributors working from a source checkout can install and run the same flow
+with `uv`:
 
 ```bash
 uv sync
 cp .env.example .env
+uv run hoverpilot-doctor
+uv run hoverpilot-validate --episodes 1 --max-episode-steps 50
 uv run hoverpilot-demo
 ```
 
-Install the optional reinforcement-learning dependencies to train or play a PPO
-policy:
+## First PPO Training Run
+
+Install the optional reinforcement-learning dependencies before training,
+evaluation, or playback:
 
 ```bash
-uv sync --extra rl
-uv run hoverpilot-ppo train --timesteps 50000 --save-path ppo_hoverpilot.pt
+pip install "hover-pilot[rl]"
 ```
+
+From a source checkout, use `uv sync --extra rl`. Start with the maintained
+elevator experiment rather than configuring PPO options individually:
 
 HoverPilot periodically evaluates the deterministic policy, keeps latest and
 best checkpoints separately, and stores the complete training state for exact
@@ -50,16 +112,15 @@ uv run hoverpilot-ppo train --config configs/elevator.toml
 Evaluate the best checkpoint or generate an HTML summary from a TensorBoard run:
 
 ```bash
-uv run hoverpilot-ppo evaluate --checkpoint ppo_hoverpilot.best.pt
-uv run hoverpilot-ppo report runs/hoverpilot-ppo
+uv run hoverpilot-ppo evaluate --checkpoint checkpoints/elevator.best.pt
+uv run hoverpilot-ppo report runs/elevator
 ```
 
 The user guide describes TOML overrides, checkpoint comparison, full-state
 resume, evaluation metrics, and HTML reports in detail.
 
-By default HoverPilot connects to RealFlight Link at `127.0.0.1:18083`. Set
-`RFLINK_HOST` when RealFlight runs on another host or outside the current network
-namespace.
+The example configuration is included in a source checkout. See the user guide
+for the equivalent installed-package workflow and advanced overrides.
 
 ## Gymnasium Environment
 
