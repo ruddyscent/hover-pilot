@@ -18,6 +18,7 @@ from .constants import (
 from .experiment_config import load_experiment_config
 from .player import PPOPlayer
 from .report import generate_training_report
+from .starter_config import write_starter_config
 from .trainer import PPOTrainer
 
 
@@ -53,6 +54,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
+
+    init_parser = subparsers.add_parser(
+        "init-config",
+        help="Write a maintained elevator starter configuration",
+    )
+    init_parser.add_argument(
+        "output",
+        nargs="?",
+        default="hoverpilot-elevator.toml",
+        help="Output path (default: hoverpilot-elevator.toml).",
+    )
+    init_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing output file.",
+    )
 
     train_parser = subparsers.add_parser("train", help="Train a PPO policy")
     train_parser.add_argument(
@@ -330,6 +347,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
+    if args.command == "init-config":
+        try:
+            output = write_starter_config(args.output, force=args.force)
+        except FileExistsError as exc:
+            print(f"[CONFIG] FAILED: {exc}")
+            return 1
+        print(f"[CONFIG] Wrote {output}")
+        print(f"[CONFIG] Start training with: hoverpilot-ppo train --config {output}")
+        return 0
     if args.command == "train":
         config = PPOConfig(
             host=args.host,

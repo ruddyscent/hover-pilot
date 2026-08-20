@@ -98,8 +98,15 @@ evaluation, or playback:
 pip install "hover-pilot[rl]"
 ```
 
-From a source checkout, use `uv sync --extra rl`. Start with the maintained
-elevator experiment rather than configuring PPO options individually:
+Create the maintained elevator starter configuration rather than configuring
+PPO options individually:
+
+```bash
+hoverpilot-ppo init-config
+hoverpilot-ppo train --config hoverpilot-elevator.toml
+```
+
+From a source checkout, use `uv sync --extra rl` and the checked-in copy:
 
 HoverPilot periodically evaluates the deterministic policy, keeps latest and
 best checkpoints separately, and stores the complete training state for exact
@@ -119,8 +126,7 @@ uv run hoverpilot-ppo report runs/elevator
 The user guide describes TOML overrides, checkpoint comparison, full-state
 resume, evaluation metrics, and HTML reports in detail.
 
-The example configuration is included in a source checkout. See the user guide
-for the equivalent installed-package workflow and advanced overrides.
+See the user guide for advanced overrides.
 
 ## Gymnasium Environment
 
