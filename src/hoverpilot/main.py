@@ -134,9 +134,11 @@ def main(argv: Optional[List[str]] = None):
         return 2
     except KeyboardInterrupt:
         print("Stopping...")
+        return 130
     finally:
         env.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

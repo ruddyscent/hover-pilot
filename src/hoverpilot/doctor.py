@@ -51,3 +51,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("[DOCTOR] OK: TCP endpoint is reachable.")
     print("[DOCTOR] No controller was injected and no flight controls were sent.")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

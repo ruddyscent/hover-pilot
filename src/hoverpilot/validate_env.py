@@ -24,10 +24,10 @@ def validate_environment(
     host: str,
     port: int,
     episodes: int = 2,
-    max_episode_steps: Optional[int] = 100,
+    max_episode_steps: int = 100,
     *,
     control_test: bool = False,
-):
+) -> int:
     env = HoverPilotHoverEnv(
         host=host,
         port=port,
@@ -42,8 +42,8 @@ def validate_environment(
     else:
         print("[VALIDATE] Safe mode: only zero-throttle idle controls will be sent.")
 
-    for episode in range(episodes):
-        try:
+    try:
+        for episode in range(episodes):
             observation, info = env.reset()
             print(f"Episode {episode + 1} reset observation shape={observation.shape}, reason={info.get('episode_start_reason')}")
             if info.get("episode_readiness"):
@@ -61,10 +61,13 @@ def validate_environment(
                 step += 1
             if step == max_episode_steps:
                 print("  reached max_episode_steps without termination")
-        except Exception as e:
-            print(f"Episode {episode + 1} failed: {e}")
-            break
-    env.close()
+    except Exception as exc:
+        print(f"[VALIDATE] FAILED: {exc}")
+        return 1
+    finally:
+        env.close()
+    print(f"[VALIDATE] OK: completed {episodes} episode(s).")
+    return 0
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -78,12 +81,17 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Send random controls to exercise action scaling (moves the aircraft).",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.episodes <= 0:
+        parser.error("--episodes must be greater than zero")
+    if args.max_episode_steps <= 0:
+        parser.error("--max-episode-steps must be greater than zero")
+    return args
 
 
-def main(argv: Optional[List[str]] = None):
+def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    validate_environment(
+    return validate_environment(
         args.host,
         args.port,
         episodes=args.episodes,
@@ -93,4 +101,4 @@ def main(argv: Optional[List[str]] = None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
