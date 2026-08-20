@@ -4,8 +4,27 @@ This guide covers installation, RealFlight Link connectivity, environment
 behavior, PPO training, validation, and platform-specific setup.
 
 For the project overview, see the [README](../README.md).
+New users should complete the shorter [Getting Started guide](getting-started.md)
+before using this document as a configuration and behavior reference.
+
+## Contents
+
+- [Quickstart](#quickstart)
+- [Gymnasium Environment](#gymnasium-environment)
+- [RealFlight Link host](#realflight-link-host)
+- [Demo](#demo)
+- [Episode Lifecycle](#episode-lifecycle)
+- [PPO Training and Environment Validation](#ppo-training-and-environment-validation)
+- [macOS Metal / MPS](#macos-metal--mps)
+- [NVIDIA Jetson](#nvidia-jetson-with-ngc-pytorch-container)
+- [TOML experiment configuration](#toml-experiment-configuration)
+- [Training, playback, evaluation, and reports](#training-playback-evaluation-and-reports)
 
 ## Quickstart
+
+For a safety-oriented first run with expected output and troubleshooting, follow
+the [Getting Started guide](getting-started.md). The commands below are the
+condensed source-checkout workflow.
 
 Recommended with `uv`:
 
@@ -329,9 +348,12 @@ checkout:
 uv run hoverpilot-ppo train --config configs/elevator.toml
 ```
 
-The example file is maintained as a repository asset and is not installed into
-the active directory by the PyPI wheel. When using a PyPI installation, download
-or copy the example first, or create an equivalent local TOML file.
+The example is also packaged in the PyPI wheel. Materialize an editable copy
+from an installed package with:
+
+```bash
+hoverpilot-ppo init-config
+```
 
 The file groups settings under `[environment]`, `[training]`, `[policy]`,
 `[episode_start]`, `[checkpoint]`, `[evaluation]`, `[logging]`, and `[rflink]`.
@@ -597,6 +619,8 @@ velocity therefore mirrors the elevator command, and the restoring sign cannot
 reverse. The critic retains its nonlinear network, but the actor has no
 separate MLP or direct position term that could cancel the recovery target.
 Unlike `elevator-pd`, it injects no fixed prior or bounded residual.
+
+### Training, playback, evaluation, and reports
 
 Elevator training defaults to 300,000 steps, a `1e-4` learning rate, `0.08`
 initial policy standard deviation, `0.0001` entropy coefficient, and 10 final

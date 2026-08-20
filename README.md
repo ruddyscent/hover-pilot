@@ -147,6 +147,7 @@ guide for observation layouts, reward and termination behavior, and trainer mode
 
 ## Documentation
 
+- [Getting started](docs/getting-started.md): safe connection check, validation, demo, and first training run
 - [User guide](docs/user-guide.md): setup, running, training, validation, and troubleshooting
 - [RealFlight Link interface](docs/realflight-link-interface.md): client API and protocol reference
 
