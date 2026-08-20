@@ -50,7 +50,6 @@ from .constants import (
     CONTROL_MODE_RUDDER,
     CONTROL_MODE_RUDDER_THROTTLE,
     CONTROL_MODE_THROTTLE,
-    CONTROL_MODES,
     DEFAULT_ENTROPY_COEF,
     DEFAULT_POLICY_STD,
     _ELEVATOR_EFFECTIVE_RESTORING_ACTION,
@@ -64,69 +63,22 @@ from .runtime import (
     _initial_env_action,
     _policy_action_space,
     _resolve_training_defaults,
-    _validate_rflink_settings,
     continue_env_after_truncation,
     reset_env_with_wait,
     resolve_device,
 )
+from .training_state import (
+    capture_rng_state,
+    checkpoint_environment_config,
+    restore_rng_state,
+)
+from .trainer_validation import validate_trainer_config
 
 
 class PPOTrainer:
     def __init__(self, config: PPOConfig):
         config = _resolve_training_defaults(config)
-        if config.timesteps <= 0:
-            raise ValueError("timesteps must be greater than zero")
-        if config.learning_rate <= 0.0:
-            raise ValueError("learning_rate must be greater than zero")
-        if config.eval_episodes <= 0:
-            raise ValueError("eval_episodes must be greater than zero")
-        if config.reward_scale <= 0.0:
-            raise ValueError("reward_scale must be greater than zero")
-        if config.entropy_coef is not None and config.entropy_coef < 0.0:
-            raise ValueError("entropy_coef must be non-negative")
-        if config.policy_initial_std is not None and config.policy_initial_std <= 0.0:
-            raise ValueError("policy_initial_std must be greater than zero")
-        if config.control_mode not in CONTROL_MODES:
-            raise ValueError(
-                f"Unsupported control mode {config.control_mode!r}; choose one of {CONTROL_MODES}."
-            )
-        _validate_rflink_settings(config)
-        if config.checkpoint_interval_steps < 0:
-            raise ValueError("checkpoint_interval_steps must be non-negative")
-        if config.eval_interval_steps < 0:
-            raise ValueError("eval_interval_steps must be non-negative")
-        if config.telemetry_log_interval_steps < 0:
-            raise ValueError("telemetry_log_interval_steps must be non-negative")
-        if (
-            not math.isfinite(config.episode_start_idle_seconds)
-            or config.episode_start_idle_seconds < 0.0
-        ):
-            raise ValueError(
-                "episode_start_idle_seconds must be a finite non-negative value"
-            )
-        if config.episode_start_idle_curriculum_steps < 0:
-            raise ValueError("episode_start_idle_curriculum_steps must be non-negative")
-        if (
-            not math.isfinite(config.episode_start_idle_curriculum_start_seconds)
-            or config.episode_start_idle_curriculum_start_seconds < 0.0
-            or config.episode_start_idle_curriculum_start_seconds
-            > config.episode_start_idle_seconds
-        ):
-            raise ValueError(
-                "episode_start_idle_curriculum_start_seconds must be finite "
-                "and between zero and episode_start_idle_seconds"
-            )
-        if (
-            not math.isfinite(config.episode_start_handoff_seconds)
-            or config.episode_start_handoff_seconds < 0.0
-        ):
-            raise ValueError(
-                "episode_start_handoff_seconds must be a finite non-negative value"
-            )
-        _validate_fixed_throttle(
-            config.episode_start_idle_throttle,
-            "episode start idle",
-        )
+        validate_trainer_config(config)
         resume_checkpoint = (
             load_policy_checkpoint(config.resume_from)
             if config.resume_from is not None
@@ -264,56 +216,13 @@ class PPOTrainer:
         )
 
     def _capture_rng_state(self) -> dict[str, object]:
-        numpy_state = np.random.get_state()
-        state: dict[str, object] = {
-            "python": random.getstate(),
-            "numpy": {
-                "bit_generator": numpy_state[0],
-                "state": torch.as_tensor(numpy_state[1].copy()),
-                "position": numpy_state[2],
-                "has_gauss": numpy_state[3],
-                "cached_gaussian": numpy_state[4],
-            },
-            "torch": torch.get_rng_state(),
-        }
-        if torch.cuda.is_available():
-            state["torch_cuda"] = torch.cuda.get_rng_state_all()
-        return state
+        return capture_rng_state()
 
     def _restore_rng_state(self, state: Mapping[str, object]) -> None:
-        python_state = state.get("python")
-        if isinstance(python_state, tuple):
-            random.setstate(python_state)
-        numpy_state = state.get("numpy")
-        if isinstance(numpy_state, Mapping) and isinstance(
-            numpy_state.get("state"), torch.Tensor
-        ):
-            np.random.set_state(
-                (
-                    str(numpy_state["bit_generator"]),
-                    numpy_state["state"].cpu().numpy().astype(np.uint32),
-                    int(numpy_state["position"]),
-                    int(numpy_state["has_gauss"]),
-                    float(numpy_state["cached_gaussian"]),
-                )
-            )
-        torch_state = state.get("torch")
-        if isinstance(torch_state, torch.Tensor):
-            torch.set_rng_state(torch_state.cpu())
-        cuda_state = state.get("torch_cuda")
-        if torch.cuda.is_available() and isinstance(cuda_state, list):
-            torch.cuda.set_rng_state_all(cuda_state)
+        restore_rng_state(state)
 
     def _environment_config(self) -> dict[str, object]:
-        return {
-            "max_episode_steps": self.config.max_episode_steps,
-            "sleep_interval_s": self.config.sleep_interval_s,
-            "episode_start_idle_seconds": self.config.episode_start_idle_seconds,
-            "episode_start_idle_throttle": self.config.episode_start_idle_throttle,
-            "episode_start_idle_curriculum_steps": self.config.episode_start_idle_curriculum_steps,
-            "episode_start_idle_curriculum_start_seconds": self.config.episode_start_idle_curriculum_start_seconds,
-            "episode_start_handoff_seconds": self.config.episode_start_handoff_seconds,
-        }
+        return checkpoint_environment_config(self.config)
 
     def _load_resume_checkpoint(
         self,
